@@ -3,10 +3,15 @@ package org.matrix.TEESimulator.interception.keystore.shim
 import android.hardware.security.keymint.Algorithm
 import android.hardware.security.keymint.BlockMode
 import android.hardware.security.keymint.Digest
+import android.hardware.security.keymint.KeyParameter
+import android.hardware.security.keymint.KeyParameterValue
 import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.PaddingMode
+import android.hardware.security.keymint.Tag
 import android.os.RemoteException
+import android.os.ServiceSpecificException
 import android.system.keystore2.IKeystoreOperation
+import android.system.keystore2.KeyParameters
 import java.security.KeyPair
 import java.security.Signature
 import java.security.SignatureException
@@ -15,13 +20,45 @@ import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
 
+/** Keystore2 error codes for ServiceSpecificException. Negative = KeyMint, positive = Keystore. */
+internal object KeystoreErrorCode {
+    const val INVALID_OPERATION_HANDLE = -28
+    const val VERIFICATION_FAILED = -30
+    const val UNSUPPORTED_PURPOSE = -2
+    const val INCOMPATIBLE_PURPOSE = -3
+    const val SYSTEM_ERROR = 4
+    const val TOO_MUCH_DATA = 21
+    const val KEY_EXPIRED = -25
+    const val KEY_NOT_YET_VALID = -24
+
+    /** KeyMint ErrorCode::CALLER_NONCE_PROHIBITED */
+    const val CALLER_NONCE_PROHIBITED = -55
+
+    /** KeyMint ErrorCode::INVALID_ARGUMENT */
+    const val INVALID_ARGUMENT = -38
+
+    /** KeyMint ErrorCode::INVALID_TAG */
+    const val INVALID_TAG = -40
+
+    /** Keystore2 ResponseCode::PERMISSION_DENIED */
+    const val PERMISSION_DENIED = 6
+
+    /** Keystore2 ResponseCode::KEY_NOT_FOUND */
+    const val KEY_NOT_FOUND = 7
+}
+
 // A sealed interface to represent the different cryptographic operations we can perform.
 private sealed interface CryptoPrimitive {
+    fun updateAad(data: ByteArray?)
+
     fun update(data: ByteArray?): ByteArray?
 
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray?
 
     fun abort()
+
+    /** Returns parameters from the begin phase (e.g. GCM nonce), or null if none. */
+    fun getBeginParameters(): Array<KeyParameter>? = null
 }
 
 // Helper object to map KeyMint constants to JCA algorithm strings.
@@ -39,8 +76,9 @@ private object JcaAlgorithmMapper {
                 Algorithm.EC -> "ECDSA"
                 Algorithm.RSA -> "RSA"
                 else ->
-                    throw IllegalArgumentException(
-                        "Unsupported signature algorithm: ${params.algorithm}"
+                    throw ServiceSpecificException(
+                        KeystoreErrorCode.SYSTEM_ERROR,
+                        "Unsupported signature algorithm: ${params.algorithm}",
                     )
             }
         return "${digest}with${keyAlgo}"
@@ -52,14 +90,16 @@ private object JcaAlgorithmMapper {
                 Algorithm.RSA -> "RSA"
                 Algorithm.AES -> "AES"
                 else ->
-                    throw IllegalArgumentException(
-                        "Unsupported cipher algorithm: ${params.algorithm}"
+                    throw ServiceSpecificException(
+                        KeystoreErrorCode.SYSTEM_ERROR,
+                        "Unsupported cipher algorithm: ${params.algorithm}",
                     )
             }
         val blockMode =
             when (params.blockMode.firstOrNull()) {
                 BlockMode.ECB -> "ECB"
                 BlockMode.CBC -> "CBC"
+                BlockMode.CTR -> "CTR"
                 BlockMode.GCM -> "GCM"
                 else -> "ECB" // Default for RSA
             }
@@ -82,6 +122,10 @@ private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimi
             initSign(keyPair.private)
         }
 
+    override fun updateAad(data: ByteArray?) {
+        throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
+    }
+
     override fun update(data: ByteArray?): ByteArray? {
         if (data != null) signature.update(data)
         return null
@@ -102,6 +146,10 @@ private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPri
             initVerify(keyPair.public)
         }
 
+    override fun updateAad(data: ByteArray?) {
+        throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
+    }
+
     override fun update(data: ByteArray?): ByteArray? {
         if (data != null) signature.update(data)
         return null
@@ -109,12 +157,17 @@ private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPri
 
     override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         if (data != null) update(data)
-        if (signature == null) throw SignatureException("Signature to verify is null")
+        if (signature == null)
+            throw ServiceSpecificException(
+                KeystoreErrorCode.VERIFICATION_FAILED,
+                "Signature to verify is null",
+            )
         if (!this.signature.verify(signature)) {
-            // Throwing an exception is how Keystore signals verification failure.
-            throw SignatureException("Signature verification failed")
+            throw ServiceSpecificException(
+                KeystoreErrorCode.VERIFICATION_FAILED,
+                "Signature/MAC verification failed",
+            )
         }
-        // A successful verification returns no data.
         return null
     }
 
@@ -123,21 +176,96 @@ private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPri
 
 // Concrete implementation for Encryption/Decryption.
 private class CipherPrimitive(
-    keyPair: KeyPair,
+    cryptoKey: java.security.Key,
     params: KeyMintAttestation,
     private val opMode: Int,
+    nonce: ByteArray?,
+    macLength: Int?,
 ) : CryptoPrimitive {
     private val cipher: Cipher =
         Cipher.getInstance(JcaAlgorithmMapper.mapCipherAlgorithm(params)).apply {
-            val key = if (opMode == Cipher.ENCRYPT_MODE) keyPair.public else keyPair.private
-            init(opMode, key)
+            val algSpec = when {
+                nonce != null && params.blockMode.contains(BlockMode.GCM) ->
+                    javax.crypto.spec.GCMParameterSpec((macLength ?: 128), nonce)
+                params.padding.contains(PaddingMode.RSA_OAEP) -> {
+                    val mgfDigest = when (params.rsaOaepMgfDigest.firstOrNull()) {
+                        Digest.SHA_2_256 -> "SHA-256"
+                        Digest.SHA_2_384 -> "SHA-384"
+                        Digest.SHA_2_512 -> "SHA-512"
+                        else -> "SHA-1"
+                    }
+                    val mainDigest = when (params.digest.firstOrNull()) {
+                        Digest.SHA_2_256 -> "SHA-256"
+                        Digest.SHA_2_384 -> "SHA-384"
+                        Digest.SHA_2_512 -> "SHA-512"
+                        else -> "SHA-1"
+                    }
+                    javax.crypto.spec.OAEPParameterSpec(
+                        mainDigest,
+                        "MGF1",
+                        java.security.spec.MGF1ParameterSpec(mgfDigest),
+                        javax.crypto.spec.PSource.PSpecified.DEFAULT,
+                    )
+                }
+                nonce != null ->
+                    javax.crypto.spec.IvParameterSpec(nonce)
+                else -> null
+            }
+            if (algSpec != null) init(opMode, cryptoKey, algSpec) else init(opMode, cryptoKey)
         }
+
+    override fun updateAad(data: ByteArray?) {
+        if (data != null) cipher.updateAAD(data)
+    }
 
     override fun update(data: ByteArray?): ByteArray? =
         if (data != null) cipher.update(data) else null
 
-    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? =
-        if (data != null) cipher.doFinal(data) else cipher.doFinal()
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        return try {
+            if (data != null) cipher.doFinal(data) else cipher.doFinal()
+        } catch (e: javax.crypto.AEADBadTagException) {
+            throw ServiceSpecificException(KeystoreErrorCode.VERIFICATION_FAILED, "GCM tag verification failed")
+        }
+    }
+
+    override fun abort() {}
+
+    /** Returns the cipher IV as a NONCE parameter for GCM operations. */
+    override fun getBeginParameters(): Array<KeyParameter>? {
+        val iv = cipher.iv ?: return null
+        return arrayOf(
+            KeyParameter().apply {
+                tag = Tag.NONCE
+                value = KeyParameterValue.blob(iv)
+            }
+        )
+    }
+}
+
+// Concrete implementation for ECDH Key Agreement.
+private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
+    private val agreement: javax.crypto.KeyAgreement =
+        javax.crypto.KeyAgreement.getInstance("ECDH").apply { init(keyPair.private) }
+
+    override fun updateAad(data: ByteArray?) {
+        throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
+    }
+
+    override fun update(data: ByteArray?): ByteArray? = null
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        if (data == null)
+            throw ServiceSpecificException(
+                KeystoreErrorCode.INVALID_ARGUMENT,
+                "Peer public key required for key agreement",
+            )
+        val peerKey =
+            java.security.KeyFactory.getInstance("EC")
+                .generatePublic(java.security.spec.X509EncodedKeySpec(data))
+        agreement.doPhase(peerKey, true)
+        return agreement.generateSecret()
+    }
 
     override fun abort() {}
 }
@@ -145,72 +273,165 @@ private class CipherPrimitive(
 /**
  * A software-only implementation of a cryptographic operation. This class acts as a controller,
  * delegating to a specific cryptographic primitive based on the operation's purpose.
+ *
+ * Tracks operation lifecycle: once [finish] or [abort] is called, subsequent calls throw
+ * [ServiceSpecificException] with [KeystoreErrorCode.INVALID_OPERATION_HANDLE].
  */
-class SoftwareOperation(private val txId: Long, keyPair: KeyPair, params: KeyMintAttestation) {
-    // This now holds the specific strategy object (Signer, Verifier, etc.)
+class SoftwareOperation(
+    private val txId: Long,
+    keyPair: KeyPair?,
+    secretKey: javax.crypto.SecretKey?,
+    params: KeyMintAttestation,
+    opParams: Array<KeyParameter> = emptyArray(),
+    var onFinishCallback: (() -> Unit)? = null,
+) {
     private val primitive: CryptoPrimitive
 
+    @Volatile private var finalized = false
+
     init {
-        // The "Strategy" pattern: choose the implementation based on the purpose.
-        // For simplicity, we only consider the first purpose listed.
         val purpose = params.purpose.firstOrNull()
         val purposeName = KeyMintParameterLogger.purposeNames[purpose] ?: "UNKNOWN"
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Initializing for purpose: $purposeName.")
 
         primitive =
             when (purpose) {
-                KeyPurpose.SIGN -> Signer(keyPair, params)
-                KeyPurpose.VERIFY -> Verifier(keyPair, params)
-                KeyPurpose.ENCRYPT -> CipherPrimitive(keyPair, params, Cipher.ENCRYPT_MODE)
-                KeyPurpose.DECRYPT -> CipherPrimitive(keyPair, params, Cipher.DECRYPT_MODE)
+                KeyPurpose.SIGN -> Signer(keyPair!!, params)
+                KeyPurpose.VERIFY -> Verifier(keyPair!!, params)
+                KeyPurpose.ENCRYPT -> {
+                    val key: java.security.Key = secretKey ?: keyPair!!.public
+                    val nonce = opParams.find { it.tag == Tag.NONCE }?.value?.blob
+                    val macLen = opParams.find { it.tag == Tag.MAC_LENGTH }?.value?.integer
+                    CipherPrimitive(key, params, Cipher.ENCRYPT_MODE, nonce, macLen)
+                }
+                KeyPurpose.DECRYPT -> {
+                    val key: java.security.Key = secretKey ?: keyPair!!.private
+                    val nonce = opParams.find { it.tag == Tag.NONCE }?.value?.blob
+                    val macLen = opParams.find { it.tag == Tag.MAC_LENGTH }?.value?.integer
+                    CipherPrimitive(key, params, Cipher.DECRYPT_MODE, nonce, macLen)
+                }
+                KeyPurpose.AGREE_KEY -> KeyAgreementPrimitive(keyPair!!)
                 else ->
-                    throw UnsupportedOperationException("Unsupported operation purpose: $purpose")
+                    throw ServiceSpecificException(
+                        KeystoreErrorCode.UNSUPPORTED_PURPOSE,
+                        "Unsupported operation purpose: $purpose",
+                    )
             }
     }
 
+    /** Parameters produced during begin (e.g. GCM nonce), to populate CreateOperationResponse. */
+    val beginParameters: KeyParameters?
+        get() {
+            val params = primitive.getBeginParameters() ?: return null
+            if (params.isEmpty()) return null
+            return KeyParameters().apply { keyParameter = params }
+        }
+
+    private fun checkActive() {
+        if (finalized)
+            throw ServiceSpecificException(
+                KeystoreErrorCode.INVALID_OPERATION_HANDLE,
+                "Operation already finalized.",
+            )
+    }
+
+    fun updateAad(data: ByteArray?) {
+        checkActive()
+        try {
+            primitive.updateAad(data)
+        } catch (e: ServiceSpecificException) {
+            finalized = true
+            throw e
+        } catch (e: Exception) {
+            finalized = true
+            SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to updateAad.", e)
+            throw ServiceSpecificException(KeystoreErrorCode.SYSTEM_ERROR, e.message)
+        }
+    }
+
     fun update(data: ByteArray?): ByteArray? {
+        checkActive()
         try {
             return primitive.update(data)
-        } catch (e: Exception) {
-            SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to update operation.", e)
+        } catch (e: ServiceSpecificException) {
+            finalized = true
             throw e
+        } catch (e: Exception) {
+            finalized = true
+            SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to update operation.", e)
+            throw ServiceSpecificException(KeystoreErrorCode.SYSTEM_ERROR, e.message)
         }
     }
 
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        checkActive()
         try {
             val result = primitive.finish(data, signature)
             SystemLogger.info("[SoftwareOp TX_ID: $txId] Finished operation successfully.")
+            try {
+                onFinishCallback?.invoke()
+            } catch (e: Exception) {
+                SystemLogger.error("[SoftwareOp TX_ID: $txId] onFinishCallback failed.", e)
+            }
             return result
+        } catch (e: ServiceSpecificException) {
+            throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to finish operation.", e)
-            // Re-throw the exception so the binder can report it to the client.
-            throw e
+            throw ServiceSpecificException(KeystoreErrorCode.SYSTEM_ERROR, e.message)
+        } finally {
+            finalized = true
         }
     }
 
     fun abort() {
+        checkActive()
+        finalized = true
         primitive.abort()
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
     }
 }
 
-/** The Binder interface for our [SoftwareOperation]. */
+/** Binder interface for [SoftwareOperation]. Synchronized and input-length validated. */
 class SoftwareOperationBinder(private val operation: SoftwareOperation) :
     IKeystoreOperation.Stub() {
 
+    private fun checkInputLength(data: ByteArray?) {
+        if (data != null && data.size > MAX_RECEIVE_DATA)
+            throw ServiceSpecificException(KeystoreErrorCode.TOO_MUCH_DATA)
+    }
+
+    @Throws(RemoteException::class)
+    override fun updateAad(aadInput: ByteArray?) {
+        synchronized(this) {
+            checkInputLength(aadInput)
+            operation.updateAad(aadInput)
+        }
+    }
+
     @Throws(RemoteException::class)
     override fun update(input: ByteArray?): ByteArray? {
-        return operation.update(input)
+        synchronized(this) {
+            checkInputLength(input)
+            return operation.update(input)
+        }
     }
 
     @Throws(RemoteException::class)
     override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
-        return operation.finish(input, signature)
+        synchronized(this) {
+            checkInputLength(input)
+            checkInputLength(signature)
+            return operation.finish(input, signature)
+        }
     }
 
     @Throws(RemoteException::class)
     override fun abort() {
-        operation.abort()
+        synchronized(this) { operation.abort() }
+    }
+
+    companion object {
+        private const val MAX_RECEIVE_DATA = 0x8000
     }
 }

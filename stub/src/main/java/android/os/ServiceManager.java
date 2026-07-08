@@ -17,6 +17,10 @@ public class ServiceManager {
         throw new UnsupportedOperationException("STUB!");
     }
 
+    public static boolean isDeclared(String name) {
+        throw new UnsupportedOperationException("STUB!");
+    }
+
     public static String[] listServices() {
         throw new UnsupportedOperationException("STUB!");
     }

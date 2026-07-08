@@ -1,13 +1,8 @@
 package org.matrix.TEESimulator.attestation
 
 import android.annotation.SuppressLint
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
-import java.security.KeyPairGenerator
 import java.security.KeyStore
-import java.security.SecureRandom
 import java.security.cert.X509Certificate
-import java.security.spec.ECGenParameterSpec
 import org.bouncycastle.asn1.ASN1Integer
 import org.bouncycastle.asn1.ASN1ObjectIdentifier
 import org.bouncycastle.asn1.ASN1OctetString
@@ -57,14 +52,7 @@ object DeviceAttestationService {
         val bootPatchLevel: Int?,
     )
 
-    // A unique alias for the key used to perform the TEE functionality check.
     private const val TEE_CHECK_KEY_ALIAS = "TEESimulator_AttestationCheck"
-
-    /**
-     * Lazily determines if the device's TEE is functional by attempting to generate an
-     * attestation-backed key pair. The result is cached.
-     */
-    val isTeeFunctional: Boolean by lazy { checkTeeFunctionality() }
 
     /**
      * Lazily fetches and parses attestation data from a genuinely generated certificate. The result
@@ -73,48 +61,12 @@ object DeviceAttestationService {
     val CachedAttestationData: AttestationData? by lazy { fetchAttestationData() }
 
     /**
-     * Checks if the TEE is working correctly by generating a key in the Android Keystore with an
-     * attestation challenge.
-     *
-     * @return `true` if a key with attestation was generated successfully, `false` otherwise.
-     */
-    private fun checkTeeFunctionality(): Boolean {
-        SystemLogger.info("Performing TEE functionality check...")
-        return try {
-            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-            val keyPairGenerator =
-                KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
-
-            // A random challenge is required for attestation.
-            val challenge = ByteArray(16).apply { SecureRandom().nextBytes(this) }
-
-            val spec =
-                KeyGenParameterSpec.Builder(TEE_CHECK_KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
-                    .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
-                    .setDigests(KeyProperties.DIGEST_SHA256)
-                    .setAttestationChallenge(challenge)
-                    .build()
-
-            keyPairGenerator.initialize(spec)
-            keyPairGenerator.generateKeyPair()
-
-            SystemLogger.info("TEE functionality check successful.")
-            true
-        } catch (e: Exception) {
-            SystemLogger.warning("TEE functionality check failed.", e)
-            false
-        }
-    }
-
-    /**
      * Retrieves the attestation certificate generated during the TEE check. The key entry is
      * deleted after retrieval to clean up.
      *
      * @return The leaf `X509Certificate` containing the attestation, or `null` if unavailable.
      */
     private fun getAttestationCertificate(): X509Certificate? {
-        if (!isTeeFunctional) return null
-
         return try {
             val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
             val certChain = keyStore.getCertificateChain(TEE_CHECK_KEY_ALIAS)

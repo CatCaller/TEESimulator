@@ -1,0 +1,4 @@
+# Ensure shell scripts always have LF line endings, even on Windows.
+# These get packaged into flashable zips and run on Android devices.
+*.sh text eol=lf
+module/daemon text eol=lf

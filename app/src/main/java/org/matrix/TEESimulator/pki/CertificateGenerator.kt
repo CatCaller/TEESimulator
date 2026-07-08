@@ -93,15 +93,13 @@ object CertificateGenerator {
     ): List<Certificate>? {
         val challenge = params.attestationChallenge
         if (challenge != null && challenge.size > AttestationConstants.CHALLENGE_LENGTH_LIMIT)
-            throw IllegalArgumentException(
-                "Attestation challenge exceeds length limit (${challenge.size} > ${AttestationConstants.CHALLENGE_LENGTH_LIMIT})"
+            throw android.os.ServiceSpecificException(
+                -21, // INVALID_INPUT_LENGTH (KM_ERROR_INVALID_INPUT_LENGTH)
             )
 
-        return runCatching {
+        return try {
                 val keybox = getKeyboxForAlgorithm(uid, params.algorithm)
 
-                // Determine the signing key and issuer. If an attestKey is provided, use it.
-                // Otherwise, fall back to the root key from the keybox.
                 val (signingKey, issuer) =
                     if (attestKeyAlias != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         getAttestationKeyInfo(uid, attestKeyAlias)?.let { it.first to it.second }
@@ -110,20 +108,20 @@ object CertificateGenerator {
                         keybox.keyPair to getIssuerFromKeybox(keybox)
                     }
 
-                // Build the new leaf certificate with the simulated attestation.
                 val leafCert =
                     buildCertificate(subjectKeyPair, signingKey, issuer, params, uid, securityLevel)
 
-                // If not self-attesting, the chain is just the leaf. Otherwise, append the keybox
-                // chain.
                 if (attestKeyAlias != null) {
                     listOf(leafCert)
                 } else {
                     listOf(leafCert) + keybox.certificates
                 }
+            } catch (e: android.os.ServiceSpecificException) {
+                throw e
+            } catch (e: Exception) {
+                SystemLogger.error("Failed to generate certificate chain.", e)
+                null
             }
-            .onFailure { SystemLogger.error("Failed to generate certificate chain.", it) }
-            .getOrNull()
     }
 
     /**
@@ -137,7 +135,7 @@ object CertificateGenerator {
         params: KeyMintAttestation,
         securityLevel: Int,
     ): Pair<KeyPair, List<Certificate>>? {
-        return runCatching {
+        return try {
                 SystemLogger.info(
                     "Generating new attested key pair for alias: '$alias' (UID: $uid)"
                 )
@@ -153,11 +151,12 @@ object CertificateGenerator {
                     "Successfully generated new certificate chain for alias: '$alias'."
                 )
                 Pair(newKeyPair, chain)
+            } catch (e: android.os.ServiceSpecificException) {
+                throw e
+            } catch (e: Exception) {
+                SystemLogger.error("Failed to generate attested key pair for alias '$alias'.", e)
+                null
             }
-            .onFailure {
-                SystemLogger.error("Failed to generate attested key pair for alias '$alias'.", it)
-            }
-            .getOrNull()
     }
 
     fun getIssuerFromKeybox(keybox: KeyBox) =
@@ -172,7 +171,10 @@ object CertificateGenerator {
                 else -> throw IllegalArgumentException("Unsupported algorithm ID: $algorithm")
             }
         return KeyBoxManager.getAttestationKey(keyboxFile, algorithmName)
-            ?: throw Exception("Could not load keybox for UID $uid and algorithm $algorithmName")
+            ?: throw android.os.ServiceSpecificException(
+                -75, // ATTESTATION_KEYS_NOT_PROVISIONED
+                "No attestation key for algorithm $algorithmName in $keyboxFile",
+            )
     }
 
     /** Retrieves the key pair and issuer name for a given attestation key alias. */
@@ -252,6 +254,8 @@ object CertificateGenerator {
             AttestationBuilder.buildAttestationExtension(params, uid, securityLevel)
         )
 
+        // The signature algorithm must match the SIGNING key, not the subject key.
+        // An EC attestation key may sign an RSA subject key's certificate (or vice versa).
         val signerAlgorithm =
             when (signingKeyPair.private) {
                 is ECKey -> "SHA256withECDSA"

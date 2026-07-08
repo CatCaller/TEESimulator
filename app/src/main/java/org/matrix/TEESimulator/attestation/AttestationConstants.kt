@@ -44,9 +44,11 @@ object AttestationConstants {
 
     // --- Key Lifetime and Usage Control ---
     const val TAG_ROLLBACK_RESISTANCE = 303
+    const val TAG_EARLY_BOOT_ONLY = 305
     const val TAG_ACTIVE_DATETIME = 400
     const val TAG_ORIGINATION_EXPIRE_DATETIME = 401
     const val TAG_USAGE_EXPIRE_DATETIME = 402
+    const val TAG_MAX_BOOT_LEVEL = 403
     const val TAG_MAX_USES_PER_BOOT = 404
     const val TAG_USAGE_COUNT_LIMIT = 405
 
@@ -56,6 +58,10 @@ object AttestationConstants {
     const val TAG_NO_AUTH_REQUIRED = 503
     const val TAG_USER_AUTH_TYPE = 504
     const val TAG_AUTH_TIMEOUT = 505
+    const val TAG_ALLOW_WHILE_ON_BODY = 506
+    const val TAG_TRUSTED_USER_PRESENCE_REQUIRED = 507
+    const val TAG_TRUSTED_CONFIRMATION_REQUIRED = 508
+    const val TAG_UNLOCKED_DEVICE_REQUIRED = 509
 
     // --- Attestation and Application Info ---
     const val TAG_APPLICATION_ID = 601

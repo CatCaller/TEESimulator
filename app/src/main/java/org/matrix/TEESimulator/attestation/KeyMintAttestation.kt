@@ -41,6 +41,23 @@ data class KeyMintAttestation(
     val manufacturer: ByteArray?,
     val model: ByteArray?,
     val secondImei: ByteArray?,
+    // Enforcement tags
+    val activeDateTime: Date?,
+    val originationExpireDateTime: Date?,
+    val usageExpireDateTime: Date?,
+    val usageCountLimit: Int?,
+    val callerNonce: Boolean?,
+    val unlockedDeviceRequired: Boolean?,
+    val includeUniqueId: Boolean?,
+    val rollbackResistance: Boolean?,
+    val earlyBootOnly: Boolean?,
+    val allowWhileOnBody: Boolean?,
+    val trustedUserPresenceRequired: Boolean?,
+    val trustedConfirmationRequired: Boolean?,
+    val maxUsesPerBoot: Int?,
+    val maxBootLevel: Int?,
+    val minMacLength: Int?,
+    val rsaOaepMgfDigest: List<Int>,
 ) {
     /** Secondary constructor that populates the fields by parsing an array of `KeyParameter`. */
     constructor(
@@ -104,6 +121,24 @@ data class KeyMintAttestation(
         manufacturer = params.findBlob(Tag.ATTESTATION_ID_MANUFACTURER),
         model = params.findBlob(Tag.ATTESTATION_ID_MODEL),
         secondImei = params.findBlob(Tag.ATTESTATION_ID_SECOND_IMEI),
+
+        // Enforcement tags
+        activeDateTime = params.findDate(Tag.ACTIVE_DATETIME),
+        originationExpireDateTime = params.findDate(Tag.ORIGINATION_EXPIRE_DATETIME),
+        usageExpireDateTime = params.findDate(Tag.USAGE_EXPIRE_DATETIME),
+        usageCountLimit = params.findInteger(Tag.USAGE_COUNT_LIMIT),
+        callerNonce = params.findBoolean(Tag.CALLER_NONCE),
+        unlockedDeviceRequired = params.findBoolean(Tag.UNLOCKED_DEVICE_REQUIRED),
+        includeUniqueId = params.findBoolean(Tag.INCLUDE_UNIQUE_ID),
+        rollbackResistance = params.findBoolean(Tag.ROLLBACK_RESISTANCE),
+        earlyBootOnly = params.findBoolean(Tag.EARLY_BOOT_ONLY),
+        allowWhileOnBody = params.findBoolean(Tag.ALLOW_WHILE_ON_BODY),
+        trustedUserPresenceRequired = params.findBoolean(Tag.TRUSTED_USER_PRESENCE_REQUIRED),
+        trustedConfirmationRequired = params.findBoolean(Tag.TRUSTED_CONFIRMATION_REQUIRED),
+        maxUsesPerBoot = params.findInteger(Tag.MAX_USES_PER_BOOT),
+        maxBootLevel = params.findInteger(Tag.MAX_BOOT_LEVEL),
+        minMacLength = params.findInteger(Tag.MIN_MAC_LENGTH),
+        rsaOaepMgfDigest = params.findAllDigests(Tag.RSA_OAEP_MGF_DIGEST),
     ) {
         // Log all parsed parameters for debugging purposes.
         params.forEach { KeyMintParameterLogger.logParameter(it) }

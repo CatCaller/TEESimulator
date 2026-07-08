@@ -1,8 +1,10 @@
 package org.matrix.TEESimulator.interception.keystore.shim
 
+import android.hardware.security.keymint.Algorithm
 import android.hardware.security.keymint.KeyOrigin
 import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyParameterValue
+import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.SecurityLevel
 import android.hardware.security.keymint.Tag
 import android.os.IBinder
@@ -11,7 +13,10 @@ import android.system.keystore2.*
 import java.security.KeyPair
 import java.security.SecureRandom
 import java.security.cert.Certificate
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import org.matrix.TEESimulator.attestation.ATTESTATION_OID
+import org.matrix.TEESimulator.attestation.AttestationConstants
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
@@ -22,6 +27,7 @@ import org.matrix.TEESimulator.logging.SystemLogger
 import org.matrix.TEESimulator.pki.CertificateGenerator
 import org.matrix.TEESimulator.pki.CertificateHelper
 import org.matrix.TEESimulator.util.AndroidDeviceUtils
+import org.matrix.TEESimulator.util.TeeLatencySimulator
 
 /**
  * Intercepts calls to an `IKeystoreSecurityLevel` service (e.g., TEE or StrongBox). This is where
@@ -34,9 +40,11 @@ class KeyMintSecurityLevelInterceptor(
 
     // --- Data Structures for State Management ---
     data class GeneratedKeyInfo(
-        val keyPair: KeyPair,
+        val keyPair: KeyPair?,
+        val secretKey: javax.crypto.SecretKey?,
         val nspace: Long,
         val response: KeyEntryResponse,
+        val keyParams: KeyMintAttestation,
     )
 
     override fun onPreTransact(
@@ -54,7 +62,7 @@ class KeyMintSecurityLevelInterceptor(
             GENERATE_KEY_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
 
-                if (!shouldSkip) return handleGenerateKey(callingUid, data)
+                if (!shouldSkip) return handleGenerateKey(callingUid, callingPid, data)
             }
             CREATE_OPERATION_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
@@ -96,8 +104,15 @@ class KeyMintSecurityLevelInterceptor(
         resultCode: Int,
     ): TransactionResult {
         // We only care about successful transactions.
-        if (resultCode != 0 || reply == null || InterceptorUtils.hasException(reply))
+        if (resultCode != 0 || reply == null || InterceptorUtils.hasException(reply)) {
+            val reason = when {
+                resultCode != 0 -> "binder error (resultCode=$resultCode)"
+                reply != null && InterceptorUtils.hasException(reply) -> "service exception in reply"
+                else -> "null reply"
+            }
+            SystemLogger.debug("[TX_ID: $txId] post-${transactionNames[code] ?: code}: skipped ($reason)")
             return TransactionResult.SkipTransaction
+        }
 
         if (code == IMPORT_KEY_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
@@ -106,7 +121,9 @@ class KeyMintSecurityLevelInterceptor(
             val keyDescriptor =
                 data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.SkipTransaction
-            cleanupKeyData(KeyIdentifier(callingUid, keyDescriptor.alias))
+            val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+            cleanupKeyData(keyId)
+            importedKeys.add(keyId)
         } else if (code == CREATE_OPERATION_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
 
@@ -133,7 +150,12 @@ class KeyMintSecurityLevelInterceptor(
                     val backdoor = getBackdoor(target)
                     if (backdoor != null) {
                         val interceptor = OperationInterceptor(operation, backdoor)
-                        register(backdoor, operationBinder, interceptor)
+                        register(
+                            backdoor,
+                            operationBinder,
+                            interceptor,
+                            OperationInterceptor.INTERCEPTED_CODES,
+                        )
                         interceptedOperations[operationBinder] = interceptor
                     } else {
                         SystemLogger.error(
@@ -164,6 +186,8 @@ class KeyMintSecurityLevelInterceptor(
                 val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                 CertificateHelper.updateCertificateChain(callingUid, metadata, newChain)
                     .getOrThrow()
+                metadata.authorizations =
+                    InterceptorUtils.patchAuthorizations(metadata.authorizations, callingUid)
 
                 // We must clean up cached generated keys before storing the patched chain
                 cleanupKeyData(keyId)
@@ -191,43 +215,188 @@ class KeyMintSecurityLevelInterceptor(
         data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
         val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)!!
 
-        // An operation must use the KEY_ID domain.
-        if (keyDescriptor.domain != Domain.KEY_ID) {
-            return TransactionResult.ContinueAndSkipPost
-        }
-
-        val nspace = keyDescriptor.nspace
-        val generatedKeyInfo = findGeneratedKeyByKeyId(callingUid, nspace)
+        // Resolve key descriptor to a generated key via nspace (KEY_ID) or alias (APP).
+        val resolvedEntry: Map.Entry<KeyIdentifier, GeneratedKeyInfo>? =
+            when (keyDescriptor.domain) {
+                Domain.KEY_ID -> {
+                    val nspace = keyDescriptor.nspace
+                    if (nspace == 0L) null
+                    else
+                        generatedKeys.entries
+                            .filter { it.key.uid == callingUid }
+                            .find { it.value.nspace == nspace }
+                }
+                Domain.APP ->
+                    keyDescriptor.alias?.let { alias ->
+                        val key = KeyIdentifier(callingUid, alias)
+                        generatedKeys[key]?.let { java.util.AbstractMap.SimpleEntry(key, it) }
+                    }
+                else -> null
+            }
+        val generatedKeyInfo = resolvedEntry?.value
+        val resolvedKeyId = resolvedEntry?.key
 
         if (generatedKeyInfo == null) {
             SystemLogger.debug(
-                "[TX_ID: $txId] Operation for unknown/hardware KeyId ($nspace). Forwarding."
+                "[TX_ID: $txId] Operation for unknown/hardware key (domain=${keyDescriptor.domain}, " +
+                    "alias=${keyDescriptor.alias}, nspace=${keyDescriptor.nspace}). Forwarding."
             )
             return TransactionResult.Continue
         }
 
-        SystemLogger.info("[TX_ID: $txId] Creating SOFTWARE operation for KeyId $nspace.")
+        SystemLogger.info(
+            "[TX_ID: $txId] Creating SOFTWARE operation for key ${generatedKeyInfo.nspace}."
+        )
 
-        val params = data.createTypedArray(KeyParameter.CREATOR)!!
-        val parsedParams = KeyMintAttestation(params)
+        val opParams = data.createTypedArray(KeyParameter.CREATOR)!!
+        val parsedOpParams = KeyMintAttestation(opParams)
+        data.readBoolean() // forced: no-op for sw ops
 
-        val softwareOperation = SoftwareOperation(txId, generatedKeyInfo.keyPair, parsedParams)
-        val operationBinder = SoftwareOperationBinder(softwareOperation)
+        val keyParams = generatedKeyInfo.keyParams
 
-        val response =
-            CreateOperationResponse().apply {
-                iOperation = operationBinder
-                operationChallenge = null
+        val requestedPurpose = parsedOpParams.purpose.firstOrNull()
+        if (requestedPurpose == null) {
+            return InterceptorUtils.createServiceSpecificErrorReply(
+                KeystoreErrorCode.INVALID_ARGUMENT
+            )
+        }
+
+        val algorithm = keyParams.algorithm
+        val isAsymmetric = algorithm == Algorithm.EC || algorithm == Algorithm.RSA
+        val unsupported =
+            (isAsymmetric &&
+                (requestedPurpose == KeyPurpose.VERIFY ||
+                    requestedPurpose == KeyPurpose.ENCRYPT)) ||
+                (requestedPurpose == KeyPurpose.AGREE_KEY && algorithm != Algorithm.EC)
+        if (unsupported) {
+            return InterceptorUtils.createServiceSpecificErrorReply(
+                KeystoreErrorCode.UNSUPPORTED_PURPOSE
+            )
+        }
+
+        if (requestedPurpose == KeyPurpose.WRAP_KEY) {
+            return InterceptorUtils.createServiceSpecificErrorReply(
+                KeystoreErrorCode.INCOMPATIBLE_PURPOSE
+            )
+        }
+
+        if (requestedPurpose !in keyParams.purpose) {
+            SystemLogger.info(
+                "[TX_ID: $txId] Rejecting: purpose $requestedPurpose not in ${keyParams.purpose}"
+            )
+            return InterceptorUtils.createServiceSpecificErrorReply(
+                KeystoreErrorCode.INCOMPATIBLE_PURPOSE
+            )
+        }
+
+        keyParams.activeDateTime?.let { activeDate ->
+            if (System.currentTimeMillis() < activeDate.time) {
+                return InterceptorUtils.createServiceSpecificErrorReply(
+                    KeystoreErrorCode.KEY_NOT_YET_VALID
+                )
             }
+        }
 
-        return InterceptorUtils.createTypedObjectReply(response)
+        // ORIGINATION_EXPIRE applies to SIGN/ENCRYPT only.
+        keyParams.originationExpireDateTime?.let { expireDate ->
+            if (
+                (requestedPurpose == KeyPurpose.SIGN ||
+                    requestedPurpose == KeyPurpose.ENCRYPT) &&
+                    System.currentTimeMillis() > expireDate.time
+            ) {
+                return InterceptorUtils.createServiceSpecificErrorReply(
+                    KeystoreErrorCode.KEY_EXPIRED
+                )
+            }
+        }
+
+        // USAGE_EXPIRE applies to DECRYPT/VERIFY only.
+        keyParams.usageExpireDateTime?.let { expireDate ->
+            if (
+                (requestedPurpose == KeyPurpose.DECRYPT ||
+                    requestedPurpose == KeyPurpose.VERIFY) &&
+                    System.currentTimeMillis() > expireDate.time
+            ) {
+                return InterceptorUtils.createServiceSpecificErrorReply(
+                    KeystoreErrorCode.KEY_EXPIRED
+                )
+            }
+        }
+
+        if (
+            (requestedPurpose == KeyPurpose.SIGN || requestedPurpose == KeyPurpose.ENCRYPT) &&
+                keyParams.callerNonce != true &&
+                opParams.any { it.tag == Tag.NONCE }
+        ) {
+            return InterceptorUtils.createServiceSpecificErrorReply(
+                KeystoreErrorCode.CALLER_NONCE_PROHIBITED
+            )
+        }
+
+        return runCatching {
+                // Use key params for crypto properties (algorithm, digest, etc.) but
+                // override purpose from the operation params.
+                val effectiveParams =
+                    keyParams.copy(
+                        purpose = parsedOpParams.purpose,
+                        digest = parsedOpParams.digest.ifEmpty { keyParams.digest },
+                        blockMode = parsedOpParams.blockMode.ifEmpty { keyParams.blockMode },
+                        padding = parsedOpParams.padding.ifEmpty { keyParams.padding },
+                    )
+                val softwareOperation =
+                    SoftwareOperation(
+                        txId,
+                        generatedKeyInfo.keyPair,
+                        generatedKeyInfo.secretKey,
+                        effectiveParams,
+                        opParams,
+                    )
+
+                // Decrement usage counter on finish; delete key when exhausted.
+                if (keyParams.usageCountLimit != null && resolvedKeyId != null) {
+                    val limit = keyParams.usageCountLimit
+                    val remaining =
+                        usageCounters.getOrPut(resolvedKeyId) {
+                            java.util.concurrent.atomic.AtomicInteger(limit)
+                        }
+                    if (remaining.get() <= 0) {
+                        cleanupKeyData(resolvedKeyId)
+                        usageCounters.remove(resolvedKeyId)
+                        throw android.os.ServiceSpecificException(KeystoreErrorCode.KEY_NOT_FOUND)
+                    }
+                    softwareOperation.onFinishCallback = {
+                        if (remaining.decrementAndGet() <= 0) {
+                            cleanupKeyData(resolvedKeyId)
+                            usageCounters.remove(resolvedKeyId)
+                        }
+                    }
+                }
+
+                val operationBinder = SoftwareOperationBinder(softwareOperation)
+
+                val response =
+                    CreateOperationResponse().apply {
+                        iOperation = operationBinder
+                        operationChallenge = null
+                        parameters = softwareOperation.beginParameters
+                    }
+
+                InterceptorUtils.createTypedObjectReply(response)
+            }
+            .getOrElse { e ->
+                SystemLogger.error("[TX_ID: $txId] Failed to create software operation.", e)
+                InterceptorUtils.createServiceSpecificErrorReply(
+                    if (e is android.os.ServiceSpecificException) e.errorCode
+                    else KeystoreErrorCode.SYSTEM_ERROR
+                )
+            }
     }
 
     /**
      * Handles the `generateKey` transaction. Based on the configuration for the calling UID, it
      * either generates a key in software or lets the call pass through to the hardware.
      */
-    private fun handleGenerateKey(callingUid: Int, data: Parcel): TransactionResult {
+    private fun handleGenerateKey(callingUid: Int, callingPid: Int, data: Parcel): TransactionResult {
         return runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)!!
@@ -235,61 +404,294 @@ class KeyMintSecurityLevelInterceptor(
                 SystemLogger.debug(
                     "Handling generateKey ${keyDescriptor.alias}, attestKey=${attestationKey?.alias}"
                 )
+
                 val params = data.createTypedArray(KeyParameter.CREATOR)!!
+
+                // Caller-provided CREATION_DATETIME is not allowed.
+                if (params.any { it.tag == Tag.CREATION_DATETIME }) {
+                    return@runCatching InterceptorUtils.createServiceSpecificErrorReply(
+                        INVALID_ARGUMENT
+                    )
+                }
+
+                // Device ID attestation requires READ_PRIVILEGED_PHONE_STATE.
+                val hasDeviceIdTags =
+                    params.any {
+                        it.tag == Tag.ATTESTATION_ID_SERIAL ||
+                            it.tag == Tag.ATTESTATION_ID_IMEI ||
+                            it.tag == Tag.ATTESTATION_ID_SECOND_IMEI ||
+                            it.tag == Tag.ATTESTATION_ID_MEID ||
+                            it.tag == Tag.DEVICE_UNIQUE_ATTESTATION
+                    }
+                if (
+                    hasDeviceIdTags &&
+                        !ConfigurationManager.hasPermissionForUid(
+                            callingUid,
+                            "android.permission.READ_PRIVILEGED_PHONE_STATE",
+                        )
+                ) {
+                    return@runCatching InterceptorUtils.createServiceSpecificErrorReply(
+                        CANNOT_ATTEST_IDS
+                    )
+                }
+
+                // INCLUDE_UNIQUE_ID requires SELinux gen_unique_id OR Android
+                // REQUEST_UNIQUE_ID_ATTESTATION (security_level.rs:478-485).
+                if (params.any { it.tag == Tag.INCLUDE_UNIQUE_ID }) {
+                    val hasSELinux =
+                        ConfigurationManager.checkSELinuxPermission(
+                            callingPid,
+                            "keystore_key",
+                            "gen_unique_id",
+                        )
+                    val hasAndroid =
+                        ConfigurationManager.hasPermissionForUid(
+                            callingUid,
+                            "android.permission.REQUEST_UNIQUE_ID_ATTESTATION",
+                        )
+                    if (!hasSELinux && !hasAndroid) {
+                        return@runCatching InterceptorUtils.createServiceSpecificErrorReply(
+                            PERMISSION_DENIED
+                        )
+                    }
+                }
+
                 val parsedParams = KeyMintAttestation(params)
                 val isAttestKeyRequest = parsedParams.isAttestKey()
 
-                // Determine if we need to generate a key based on config or
-                // if it's an attestation request in patch mode.
-                val needsSoftwareGeneration =
+                val forceGenerate =
                     ConfigurationManager.shouldGenerate(callingUid) ||
                         (ConfigurationManager.shouldPatch(callingUid) && isAttestKeyRequest) ||
                         (attestationKey != null &&
                             isAttestationKey(KeyIdentifier(callingUid, attestationKey.alias)))
 
-                if (needsSoftwareGeneration) {
-                    keyDescriptor.nspace = secureRandom.nextLong()
-                    SystemLogger.info(
-                        "Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}]."
-                    )
+                val isAuto = ConfigurationManager.isAutoMode(callingUid)
 
-                    // Generate the key pair and certificate chain.
-                    val keyData =
-                        CertificateGenerator.generateAttestedKeyPair(
-                            callingUid,
-                            keyDescriptor.alias,
-                            attestationKey?.alias,
-                            parsedParams,
-                            securityLevel,
-                        ) ?: throw Exception("CertificateGenerator failed to create key pair.")
-
-                    val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
-                    // It is unnecessary but a good practice to clean up possible caches
-                    cleanupKeyData(keyId)
-                    // Store the generated key data.
-                    val response =
-                        buildKeyEntryResponse(
-                            callingUid,
-                            keyData.second,
-                            parsedParams,
-                            keyDescriptor,
+                when {
+                    forceGenerate -> {
+                        SystemLogger.debug("generateKey ${keyDescriptor.alias}: mode=GENERATE")
+                        doSoftwareGeneration(
+                            callingUid, keyDescriptor, attestationKey, parsedParams, isAttestKeyRequest
                         )
-                    generatedKeys[keyId] =
-                        GeneratedKeyInfo(keyData.first, keyDescriptor.nspace, response)
-                    if (isAttestKeyRequest) attestationKeys.add(keyId)
-
-                    // Return the metadata of our generated key, skipping the real hardware call.
-                    InterceptorUtils.createTypedObjectReply(response.metadata)
-                } else if (parsedParams.attestationChallenge != null) {
-                    TransactionResult.Continue
-                } else {
-                    TransactionResult.ContinueAndSkipPost
+                    }
+                    isAuto && !teeFunctional -> {
+                        SystemLogger.debug("generateKey ${keyDescriptor.alias}: mode=AUTO (racing)")
+                        raceTeePatch(
+                            callingUid, keyDescriptor, attestationKey, params, parsedParams, isAttestKeyRequest
+                        )
+                    }
+                    parsedParams.attestationChallenge != null -> {
+                        SystemLogger.debug("generateKey ${keyDescriptor.alias}: mode=PATCH (forwarding to TEE)")
+                        TransactionResult.Continue
+                    }
+                    else -> {
+                        SystemLogger.debug("generateKey ${keyDescriptor.alias}: no challenge, passthrough")
+                        TransactionResult.ContinueAndSkipPost
+                    }
                 }
             }
-            .getOrElse {
-                SystemLogger.error("No key pair generated for UID $callingUid.", it)
-                TransactionResult.ContinueAndSkipPost
+            .getOrElse { e ->
+                SystemLogger.error("generateKey failed for UID $callingUid: ${e.javaClass.simpleName}", e)
+                val code =
+                    if (e is android.os.ServiceSpecificException) e.errorCode
+                    else SECURE_HW_COMMUNICATION_FAILED
+                InterceptorUtils.createServiceSpecificErrorReply(code)
             }
+    }
+
+    /** Performs software key generation and caches the result. */
+    private fun doSoftwareGeneration(
+        callingUid: Int,
+        keyDescriptor: KeyDescriptor,
+        attestationKey: KeyDescriptor?,
+        parsedParams: KeyMintAttestation,
+        isAttestKeyRequest: Boolean,
+    ): TransactionResult {
+        val genStartNanos = System.nanoTime()
+        keyDescriptor.nspace = secureRandom.nextLong()
+        SystemLogger.info(
+            "Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}]."
+        )
+
+        val isSymmetric =
+            parsedParams.algorithm != Algorithm.EC && parsedParams.algorithm != Algorithm.RSA
+
+        val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+        cleanupKeyData(keyId)
+
+        if (isSymmetric) {
+            val algoName =
+                when (parsedParams.algorithm) {
+                    Algorithm.AES -> "AES"
+                    Algorithm.HMAC -> "HmacSHA256"
+                    else -> throw android.os.ServiceSpecificException(
+                        SECURE_HW_COMMUNICATION_FAILED,
+                        "Unsupported symmetric algorithm: ${parsedParams.algorithm}",
+                    )
+                }
+            val keyGen = javax.crypto.KeyGenerator.getInstance(algoName)
+            keyGen.init(parsedParams.keySize)
+            val secretKey = keyGen.generateKey()
+
+            val metadata = KeyMetadata().apply {
+                keySecurityLevel = securityLevel
+                key = KeyDescriptor().apply {
+                    domain = Domain.KEY_ID
+                    nspace = keyDescriptor.nspace
+                    alias = null
+                    blob = null
+                }
+                certificate = null
+                certificateChain = null
+                authorizations = parsedParams.toAuthorizations(callingUid, securityLevel)
+                modificationTimeMs = System.currentTimeMillis()
+            }
+            val response = KeyEntryResponse().apply {
+                this.metadata = metadata
+                iSecurityLevel = original
+            }
+            generatedKeys[keyId] =
+                GeneratedKeyInfo(null, secretKey, keyDescriptor.nspace, response, parsedParams)
+            TeeLatencySimulator.simulateGenerateKeyDelay(
+                parsedParams.algorithm, System.nanoTime() - genStartNanos
+            )
+            return InterceptorUtils.createTypedObjectReply(metadata)
+        }
+
+        val keyData =
+            CertificateGenerator.generateAttestedKeyPair(
+                callingUid,
+                keyDescriptor.alias,
+                attestationKey?.alias,
+                parsedParams,
+                securityLevel,
+            ) ?: throw Exception("CertificateGenerator failed to create key pair.")
+
+        val response =
+            buildKeyEntryResponse(callingUid, keyData.second, parsedParams, keyDescriptor)
+        generatedKeys[keyId] =
+            GeneratedKeyInfo(keyData.first, null, keyDescriptor.nspace, response, parsedParams)
+        if (isAttestKeyRequest) attestationKeys.add(keyId)
+
+        TeeLatencySimulator.simulateGenerateKeyDelay(
+            parsedParams.algorithm, System.nanoTime() - genStartNanos
+        )
+        val elapsedMs = (System.nanoTime() - genStartNanos) / 1_000_000.0
+        SystemLogger.debug(
+            "doSoftwareGeneration ${keyDescriptor.alias}: completed in %.1fms (chain=${keyData.second.size} certs, nspace=${keyDescriptor.nspace})".format(elapsedMs)
+        )
+        return InterceptorUtils.createTypedObjectReply(response.metadata)
+    }
+
+    /**
+     * Races TEE hardware generation against software generation concurrently for AUTO mode.
+     * If TEE succeeds, the software future is cancelled and TEE is marked functional.
+     * If TEE fails, the already-running software result is used without additional delay.
+     */
+    private fun raceTeePatch(
+        callingUid: Int,
+        keyDescriptor: KeyDescriptor,
+        attestationKey: KeyDescriptor?,
+        rawParams: Array<KeyParameter>,
+        parsedParams: KeyMintAttestation,
+        isAttestKeyRequest: Boolean,
+    ): TransactionResult {
+        SystemLogger.info("AUTO: racing TEE vs software for ${keyDescriptor.alias}")
+
+        val teeDescriptor = KeyDescriptor().apply {
+            domain = keyDescriptor.domain
+            nspace = keyDescriptor.nspace
+            alias = keyDescriptor.alias
+            blob = keyDescriptor.blob
+        }
+        val teeAttestKey =
+            attestationKey?.let {
+                KeyDescriptor().apply {
+                    domain = it.domain
+                    nspace = it.nspace
+                    alias = it.alias
+                    blob = it.blob
+                }
+            }
+
+        val threadA = CompletableFuture.supplyAsync {
+            original.generateKey(teeDescriptor, teeAttestKey, rawParams, 0, byteArrayOf())
+        }
+
+        val swDescriptor = KeyDescriptor().apply {
+            domain = keyDescriptor.domain
+            nspace = secureRandom.nextLong()
+            alias = keyDescriptor.alias
+            blob = keyDescriptor.blob
+        }
+
+        val threadB = CompletableFuture.supplyAsync {
+            doSoftwareGeneration(
+                callingUid, swDescriptor, attestationKey, parsedParams, isAttestKeyRequest
+            )
+        }
+
+        return try {
+            val teeMetadata = threadA.join()
+            threadB.cancel(true)
+
+            val originalChain = CertificateHelper.getCertificateChain(teeMetadata)
+
+            // Verify TEE attestation: the leaf cert must contain the attestation
+            // extension with the exact challenge we requested. Only then is the TEE
+            // proven capable of attestation and the chain can be patched.
+            if (parsedParams.attestationChallenge != null &&
+                originalChain != null && originalChain.size > 1
+            ) {
+                val verified = runCatching {
+                    val leaf = org.bouncycastle.cert.X509CertificateHolder(originalChain[0].encoded)
+                    val ext = leaf.getExtension(ATTESTATION_OID)
+                    if (ext != null) {
+                        val seq = org.bouncycastle.asn1.ASN1Sequence.getInstance(ext.extnValue.octets)
+                        val challenge = (seq.getObjectAt(
+                            AttestationConstants.KEY_DESCRIPTION_ATTESTATION_CHALLENGE_INDEX
+                        ) as org.bouncycastle.asn1.ASN1OctetString).octets
+                        challenge.contentEquals(parsedParams.attestationChallenge)
+                    } else false
+                }.getOrDefault(false)
+
+                if (verified) {
+                    teeFunctional = true
+                    SystemLogger.info("AUTO: TEE attestation verified for ${keyDescriptor.alias}, marked functional.")
+
+                    val newChain = AttestationPatcher.patchCertificateChain(originalChain, callingUid)
+                    CertificateHelper.updateCertificateChain(teeMetadata, newChain).getOrThrow()
+                    teeMetadata.authorizations =
+                        InterceptorUtils.patchAuthorizations(teeMetadata.authorizations, callingUid)
+                    val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+                    cleanupKeyData(keyId)
+                    patchedChains[keyId] = newChain
+                }
+            }
+
+            // Cache the patched response for getKeyEntry. Stored in teeResponses
+            // (not generatedKeys) so createOperation forwards to real hardware.
+            val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+            val patchedResponse = KeyEntryResponse().apply {
+                this.metadata = teeMetadata
+                iSecurityLevel = original
+            }
+            teeResponses[keyId] = patchedResponse
+
+            InterceptorUtils.createTypedObjectReply(teeMetadata)
+        } catch (_: Exception) {
+            SystemLogger.info("AUTO: TEE failed for ${keyDescriptor.alias}, using software result.")
+            try {
+                threadB.join()
+            } catch (e: Exception) {
+                SystemLogger.error("AUTO: both paths failed for ${keyDescriptor.alias}.", e)
+                val code =
+                    if (e.cause is android.os.ServiceSpecificException)
+                        (e.cause as android.os.ServiceSpecificException).errorCode
+                    else SECURE_HW_COMMUNICATION_FAILED
+                InterceptorUtils.createServiceSpecificErrorReply(code)
+            }
+        }
     }
 
     /**
@@ -326,6 +728,14 @@ class KeyMintSecurityLevelInterceptor(
     companion object {
         private val secureRandom = SecureRandom()
 
+        /** Once set to true, AUTO mode skips the race and uses PATCH directly. */
+        @Volatile var teeFunctional = false
+
+        private const val INVALID_ARGUMENT = 20
+        private const val PERMISSION_DENIED = 6
+        private const val SECURE_HW_COMMUNICATION_FAILED = -49
+        private const val CANNOT_ATTEST_IDS = -66
+
         // Transaction codes for IKeystoreSecurityLevel interface.
         private val GENERATE_KEY_TRANSACTION =
             InterceptorUtils.getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
@@ -336,6 +746,10 @@ class KeyMintSecurityLevelInterceptor(
                 IKeystoreSecurityLevel.Stub::class.java,
                 "createOperation",
             )
+
+        /** Only these transaction codes need native-level interception. */
+        val INTERCEPTED_CODES =
+            intArrayOf(GENERATE_KEY_TRANSACTION, IMPORT_KEY_TRANSACTION, CREATE_OPERATION_TRANSACTION)
 
         private val transactionNames: Map<Int, String> by lazy {
             IKeystoreSecurityLevel.Stub::class
@@ -354,12 +768,19 @@ class KeyMintSecurityLevelInterceptor(
         val attestationKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
         // Caches patched certificate chains to prevent re-generation and signature inconsistencies.
         val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
+        // Keys imported via importKey; getKeyEntry must not override these.
+        val importedKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
+        // TEE-generated responses cached for getKeyEntry (not for createOperation).
+        val teeResponses = ConcurrentHashMap<KeyIdentifier, KeyEntryResponse>()
+        // Tracks remaining usage count per key for USAGE_COUNT_LIMIT enforcement.
+        private val usageCounters =
+            ConcurrentHashMap<KeyIdentifier, java.util.concurrent.atomic.AtomicInteger>()
         // Stores interceptors for active cryptographic operations.
         private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
         // --- Public Accessors for Other Interceptors ---
         fun getGeneratedKeyResponse(keyId: KeyIdentifier): KeyEntryResponse? =
-            generatedKeys[keyId]?.response
+            generatedKeys[keyId]?.response ?: teeResponses[keyId]
 
         /**
          * Finds a software-generated key by first filtering all known keys by the caller's UID, and
@@ -393,6 +814,9 @@ class KeyMintSecurityLevelInterceptor(
             if (attestationKeys.remove(keyId)) {
                 SystemLogger.debug("Remove cached attestaion key ${keyId}")
             }
+            importedKeys.remove(keyId)
+            usageCounters.remove(keyId)
+            teeResponses.remove(keyId)
         }
 
         fun removeOperationInterceptor(operationBinder: IBinder, backdoor: IBinder) {
@@ -411,6 +835,9 @@ class KeyMintSecurityLevelInterceptor(
             generatedKeys.clear()
             patchedChains.clear()
             attestationKeys.clear()
+            importedKeys.clear()
+            usageCounters.clear()
+            teeResponses.clear()
             SystemLogger.info("Cleared all cached keys ($count entries)$reasonMessage.")
         }
     }
@@ -477,6 +904,42 @@ private fun KeyMintAttestation.toAuthorizations(
         )
     }
 
+    if (this.callerNonce == true) {
+        authList.add(createAuth(Tag.CALLER_NONCE, KeyParameterValue.boolValue(true)))
+    }
+    if (this.minMacLength != null) {
+        authList.add(createAuth(Tag.MIN_MAC_LENGTH, KeyParameterValue.integer(this.minMacLength)))
+    }
+    if (this.rollbackResistance == true) {
+        authList.add(createAuth(Tag.ROLLBACK_RESISTANCE, KeyParameterValue.boolValue(true)))
+    }
+    if (this.earlyBootOnly == true) {
+        authList.add(createAuth(Tag.EARLY_BOOT_ONLY, KeyParameterValue.boolValue(true)))
+    }
+    if (this.allowWhileOnBody == true) {
+        authList.add(createAuth(Tag.ALLOW_WHILE_ON_BODY, KeyParameterValue.boolValue(true)))
+    }
+    if (this.trustedUserPresenceRequired == true) {
+        authList.add(
+            createAuth(Tag.TRUSTED_USER_PRESENCE_REQUIRED, KeyParameterValue.boolValue(true))
+        )
+    }
+    if (this.trustedConfirmationRequired == true) {
+        authList.add(
+            createAuth(Tag.TRUSTED_CONFIRMATION_REQUIRED, KeyParameterValue.boolValue(true))
+        )
+    }
+    if (this.maxUsesPerBoot != null) {
+        authList.add(
+            createAuth(Tag.MAX_USES_PER_BOOT, KeyParameterValue.integer(this.maxUsesPerBoot))
+        )
+    }
+    if (this.maxBootLevel != null) {
+        authList.add(
+            createAuth(Tag.MAX_BOOT_LEVEL, KeyParameterValue.integer(this.maxBootLevel))
+        )
+    }
+
     authList.add(
         createAuth(Tag.ORIGIN, KeyParameterValue.origin(this.origin ?: KeyOrigin.GENERATED))
     )
@@ -494,17 +957,49 @@ private fun KeyMintAttestation.toAuthorizations(
     val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(callingUid)
     authList.add(createAuth(Tag.BOOT_PATCHLEVEL, KeyParameterValue.integer(bootPatch)))
 
+    // Software-enforced tags: CREATION_DATETIME, enforcement dates, USER_ID.
+    fun createSwAuth(tag: Int, value: KeyParameterValue): Authorization {
+        val param =
+            KeyParameter().apply {
+                this.tag = tag
+                this.value = value
+            }
+        return Authorization().apply {
+            this.keyParameter = param
+            this.securityLevel = SecurityLevel.SOFTWARE
+        }
+    }
+
     authList.add(
-        createAuth(Tag.CREATION_DATETIME, KeyParameterValue.dateTime(System.currentTimeMillis()))
+        createSwAuth(Tag.CREATION_DATETIME, KeyParameterValue.dateTime(System.currentTimeMillis()))
     )
+
+    this.activeDateTime?.let {
+        authList.add(createSwAuth(Tag.ACTIVE_DATETIME, KeyParameterValue.dateTime(it.time)))
+    }
+    this.originationExpireDateTime?.let {
+        authList.add(
+            createSwAuth(Tag.ORIGINATION_EXPIRE_DATETIME, KeyParameterValue.dateTime(it.time))
+        )
+    }
+    this.usageExpireDateTime?.let {
+        authList.add(
+            createSwAuth(Tag.USAGE_EXPIRE_DATETIME, KeyParameterValue.dateTime(it.time))
+        )
+    }
+    this.usageCountLimit?.let {
+        authList.add(createSwAuth(Tag.USAGE_COUNT_LIMIT, KeyParameterValue.integer(it)))
+    }
+    if (this.unlockedDeviceRequired == true) {
+        authList.add(
+            createSwAuth(Tag.UNLOCKED_DEVICE_REQUIRED, KeyParameterValue.boolValue(true))
+        )
+    }
 
     // AOSP class android.os.UserHandle: PER_USER_RANGE = 100000;
     authList.add(
-        createAuth(
-            Tag.USER_ID,
-            KeyParameterValue.integer(callingUid / 100000),
-            SecurityLevel.SOFTWARE,
-        )
+        createSwAuth(Tag.USER_ID, KeyParameterValue.integer(callingUid / 100000))
+    )
     )
 
     return authList.toTypedArray()

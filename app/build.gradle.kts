@@ -120,9 +120,14 @@ androidComponents {
                 }
 
                 // Now, copy and process the files from 'module' directory.
+                // Force LF endings; a CRLF shebang in `daemon` breaks service.sh's exec of it.
                 val sourceModuleDir = rootProject.projectDir.resolve("module")
                 from(sourceModuleDir) {
                     exclude("module.prop", "service.sh") // Exclude templated files.
+                    filter(
+                        mapOf("eol" to org.apache.tools.ant.filters.FixCrLfFilter.CrLf.newInstance("lf")),
+                        org.apache.tools.ant.filters.FixCrLfFilter::class.java,
+                    )
                 }
 
                 // Copy and filter the module.prop template separately.

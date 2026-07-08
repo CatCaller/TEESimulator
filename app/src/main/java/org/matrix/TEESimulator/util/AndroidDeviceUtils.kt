@@ -116,12 +116,12 @@ object AndroidDeviceUtils {
     }
 
     /**
-     * Retrieves a system property and validates its format.
+     * Retrieves a system property and validates its format. Rejects all-zero values — those only
+     * show up when verification is disabled and would leak that state.
      *
-     * @param name The name of the system property.
-     * @param expectedSize The expected byte length of the property (e.g., 32 for a 64-char hex
-     *   string).
-     * @return The property value as a ByteArray, or null if not found or invalid.
+     * @param name The name of the property.
+     * @param expectedSize The expected byte length of the property.
+     * @return The property value as a ByteArray, or null if not found, invalid, or all-zero.
      */
     @OptIn(ExperimentalStdlibApi::class)
     private fun getProperty(name: String, expectedSize: Int): ByteArray? {
@@ -130,7 +130,17 @@ object AndroidDeviceUtils {
             return null
         }
         // A valid digest is (2 * size) hex characters.
-        return if (value.length == expectedSize * 2) value.hexToByteArray() else null
+        if (value.length != expectedSize * 2) {
+            return null
+        }
+        val bytes = value.hexToByteArray()
+        if (bytes.all { it == 0.toByte() }) {
+            SystemLogger.debug(
+                "System property '$name' is all-zero (verification disabled); ignoring it."
+            )
+            return null
+        }
+        return bytes
     }
 
     /**

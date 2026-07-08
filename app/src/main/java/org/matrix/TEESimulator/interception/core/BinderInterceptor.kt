@@ -126,86 +126,97 @@ abstract class BinderInterceptor : Binder() {
 
     /** Decodes the parcel for a pre-transaction hook and calls the user-overridable method. */
     private fun handlePreTransact(txId: Long, data: Parcel): TransactionResult {
-        // The native hook marshals the original transaction's arguments into the data parcel.
-        val target = data.readStrongBinder()!!
-        val transactionCode = data.readInt()
-        val transactionFlags = data.readInt()
-        val callingUid = data.readInt()
-        val callingPid = data.readInt()
-        val dataSize = data.readLong()
-
-        // We must create a new parcel containing only the original transaction data.
-        val transactionData = Parcel.obtain()
+        // Every parcel read below can throw on malformed/truncated data from the native hook;
+        // none of it may happen outside the try block or an uncaught exception here crosses the
+        // JNI boundary and can take down the process hosting the real service we're hooking.
+        var transactionCode = -1
+        var callingUid = -1
         return try {
-            transactionData.appendFrom(data, data.dataPosition(), dataSize.toInt())
-            transactionData.setDataPosition(0)
-            onPreTransact(
-                txId,
-                target,
-                transactionCode,
-                transactionFlags,
-                callingUid,
-                callingPid,
-                transactionData,
-            )
+            // The native hook marshals the original transaction's arguments into the data parcel.
+            val target = data.readStrongBinder() ?: return TransactionResult.ContinueAndSkipPost
+            transactionCode = data.readInt()
+            val transactionFlags = data.readInt()
+            callingUid = data.readInt()
+            val callingPid = data.readInt()
+            val dataSize = data.readLong()
+
+            // We must create a new parcel containing only the original transaction data.
+            val transactionData = Parcel.obtain()
+            try {
+                transactionData.appendFrom(data, data.dataPosition(), dataSize.toInt())
+                transactionData.setDataPosition(0)
+                onPreTransact(
+                    txId,
+                    target,
+                    transactionCode,
+                    transactionFlags,
+                    callingUid,
+                    callingPid,
+                    transactionData,
+                )
+            } finally {
+                transactionData.recycle()
+            }
         } catch (e: Exception) {
             SystemLogger.error(
                 "[TX_ID: $txId] onPreTransact crashed (code=$transactionCode, uid=$callingUid)",
                 e,
             )
             TransactionResult.ContinueAndSkipPost
-        } finally {
-            transactionData.recycle()
         }
     }
 
     /** Decodes the parcel for a post-transaction hook and calls the user-overridable method. */
     private fun handlePostTransact(txId: Long, data: Parcel): TransactionResult {
-        val target = data.readStrongBinder()!!
-        val transactionCode = data.readInt()
-        val transactionFlags = data.readInt()
-        val callingUid = data.readInt()
-        val callingPid = data.readInt()
-
-        // The native hook also marshals the original data and reply parcels.
-        val transactionData = Parcel.obtain()
-        val transactionReply = Parcel.obtain()
+        var transactionCode = -1
+        var callingUid = -1
         return try {
-            val dataSize = data.readLong().toInt()
-            transactionData.appendFrom(data, data.dataPosition(), dataSize)
-            transactionData.setDataPosition(0)
-            data.setDataPosition(data.dataPosition() + dataSize)
+            val target = data.readStrongBinder() ?: return TransactionResult.SkipTransaction
+            transactionCode = data.readInt()
+            val transactionFlags = data.readInt()
+            callingUid = data.readInt()
+            val callingPid = data.readInt()
 
-            val resultCode = data.readInt()
+            // The native hook also marshals the original data and reply parcels.
+            val transactionData = Parcel.obtain()
+            val transactionReply = Parcel.obtain()
+            try {
+                val dataSize = data.readLong().toInt()
+                transactionData.appendFrom(data, data.dataPosition(), dataSize)
+                transactionData.setDataPosition(0)
+                data.setDataPosition(data.dataPosition() + dataSize)
 
-            val replySize = data.readLong().toInt()
-            val reply =
-                if (replySize > 0) {
-                    transactionReply.appendFrom(data, data.dataPosition(), replySize)
-                    transactionReply.setDataPosition(0)
-                    transactionReply
-                } else null
+                val resultCode = data.readInt()
 
-            onPostTransact(
-                txId,
-                target,
-                transactionCode,
-                transactionFlags,
-                callingUid,
-                callingPid,
-                transactionData,
-                reply,
-                resultCode,
-            )
+                val replySize = data.readLong().toInt()
+                val reply =
+                    if (replySize > 0) {
+                        transactionReply.appendFrom(data, data.dataPosition(), replySize)
+                        transactionReply.setDataPosition(0)
+                        transactionReply
+                    } else null
+
+                onPostTransact(
+                    txId,
+                    target,
+                    transactionCode,
+                    transactionFlags,
+                    callingUid,
+                    callingPid,
+                    transactionData,
+                    reply,
+                    resultCode,
+                )
+            } finally {
+                transactionData.recycle()
+                transactionReply.recycle()
+            }
         } catch (e: Exception) {
             SystemLogger.error(
-                "[TX_ID: $txId] onPostTransact crashed (code=$transactionCode, uid=$callingUid, resultCode=${data.readInt()})",
+                "[TX_ID: $txId] onPostTransact crashed (code=$transactionCode, uid=$callingUid)",
                 e,
             )
             TransactionResult.SkipTransaction
-        } finally {
-            transactionData.recycle()
-            transactionReply.recycle()
         }
     }
 

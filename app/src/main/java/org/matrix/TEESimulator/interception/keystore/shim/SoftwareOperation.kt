@@ -254,12 +254,19 @@ private class CipherPrimitive(
             if (algSpec != null) init(opMode, cryptoKey, algSpec) else init(opMode, cryptoKey)
         }
 
+    // KeyMint HAL requires updateAad to happen before any update() call; once data processing
+    // starts, further AAD is rejected with INVALID_OPERATION_HANDLE, not a raw cipher exception.
+    private var aadWindowClosed = false
+
     override fun updateAad(data: ByteArray?) {
+        if (aadWindowClosed) throw ServiceSpecificException(KeystoreErrorCode.INVALID_OPERATION_HANDLE)
         if (data != null) cipher.updateAAD(data)
     }
 
-    override fun update(data: ByteArray?): ByteArray? =
-        if (data != null) cipher.update(data) else null
+    override fun update(data: ByteArray?): ByteArray? {
+        aadWindowClosed = true
+        return if (data != null) cipher.update(data) else null
+    }
 
     override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         return try {

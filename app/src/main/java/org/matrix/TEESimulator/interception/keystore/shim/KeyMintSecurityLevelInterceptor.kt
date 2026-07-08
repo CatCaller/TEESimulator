@@ -193,9 +193,15 @@ class KeyMintSecurityLevelInterceptor(
 
                 // We must clean up cached generated keys before storing the patched chain
                 cleanupKeyData(keyId)
-                patchedChains[keyId] = newChain
+                // Keyed by the key's own nspace, not (uid, alias): the same key can later be read
+                // back by an owner, a grantee, or a different Android user profile, each with a
+                // different uid/alias, and patching signs with a non-deterministic signature — a
+                // uid-scoped cache key would give each accessor a mismatching certificate.
+                val patchCacheKey =
+                    if (key.nspace != 0L) KeyIdentifier(0, "nspace:${key.nspace}") else keyId
+                patchedChains[patchCacheKey] = newChain
                 SystemLogger.debug(
-                    "Cached patched certificate chain for $keyId. (${key.alias} [${key.domain}, ${key.nspace}])"
+                    "Cached patched certificate chain for $patchCacheKey. (${key.alias} [${key.domain}, ${key.nspace}])"
                 )
 
                 return InterceptorUtils.createTypedObjectReply(metadata)
@@ -643,7 +649,16 @@ class KeyMintSecurityLevelInterceptor(
                         InterceptorUtils.patchAuthorizations(teeMetadata.authorizations, callingUid)
                     val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                     cleanupKeyData(keyId)
-                    patchedChains[keyId] = newChain
+                    // See the matching comment in the GENERATE_KEY_TRANSACTION handler: key by
+                    // nspace so other accessors of the same key hit the same cached chain.
+                    val teeNspace = teeMetadata.key?.nspace
+                    val patchCacheKey =
+                        if (teeNspace != null && teeNspace != 0L) {
+                            KeyIdentifier(0, "nspace:$teeNspace")
+                        } else {
+                            keyId
+                        }
+                    patchedChains[patchCacheKey] = newChain
                 }
             }
 

@@ -377,27 +377,38 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return TransactionResult.SkipTransaction
                     }
 
-                    // First, try to retrieve the already-patched chain from our cache to ensure
-                    // consistency.
-                    val cachedChain = KeyMintSecurityLevelInterceptor.getPatchedChain(keyId)
+                    // Cache the patched chain by the key's own nspace, not by (callingUid, alias):
+                    // the same hardware key can be reached by an owner, a grantee, or a different
+                    // Android user profile, each with a different uid/alias, and patching signs
+                    // with a non-deterministic signature — a uid-scoped cache key would give each
+                    // accessor a different, mismatching certificate for the same key.
+                    val keyNspace = response.metadata.key?.nspace
+                    val patchCacheKey =
+                        if (keyNspace != null && keyNspace != 0L) {
+                            KeyIdentifier(0, "nspace:$keyNspace")
+                        } else {
+                            keyId
+                        }
+
+                    val cachedChain = KeyMintSecurityLevelInterceptor.getPatchedChain(patchCacheKey)
 
                     val finalChain: Array<Certificate>
                     if (cachedChain != null) {
                         SystemLogger.debug(
-                            "[TX_ID: $txId] Using cached patched certificate chain for $keyId."
+                            "[TX_ID: $txId] Using cached patched certificate chain for $patchCacheKey."
                         )
                         finalChain = cachedChain
                     } else {
                         // If no chain is cached (e.g., key existed before simulator started),
                         // perform a live patch as a fallback. This may still be detectable.
                         SystemLogger.info(
-                            "[TX_ID: $txId] No cached chain for $keyId. Performing live patch as a fallback."
+                            "[TX_ID: $txId] No cached chain for $patchCacheKey. Performing live patch as a fallback."
                         )
                         finalChain =
                             AttestationPatcher.patchCertificateChain(originalChain, callingUid)
 
-                        KeyMintSecurityLevelInterceptor.patchedChains[keyId] = finalChain
-                        SystemLogger.debug("Cached patched certificate chain for $keyId.")
+                        KeyMintSecurityLevelInterceptor.patchedChains[patchCacheKey] = finalChain
+                        SystemLogger.debug("Cached patched certificate chain for $patchCacheKey.")
                     }
 
                     CertificateHelper.updateCertificateChain(

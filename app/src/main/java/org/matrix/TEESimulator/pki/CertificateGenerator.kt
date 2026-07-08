@@ -139,18 +139,28 @@ object CertificateGenerator {
         return try {
                 val keybox = getKeyboxForAlgorithm(uid, params.algorithm)
 
-                val (signingKey, issuer) =
+                // Only a real cached attest key has its own chain already known client-side;
+                // any fallback to keybox signing needs the keybox chain appended.
+                val realAttestKeyInfo: Pair<KeyPair, X500Name>? =
                     if (attestKeyAlias != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        getAttestationKeyInfo(uid, attestKeyAlias)?.let { it.first to it.second }
-                            ?: (keybox.keyPair to getIssuerFromKeybox(keybox))
+                        getAttestationKeyInfo(uid, attestKeyAlias)
                     } else {
-                        keybox.keyPair to getIssuerFromKeybox(keybox)
+                        null
                     }
+                val signingKey: KeyPair
+                val issuer: X500Name
+                if (realAttestKeyInfo != null) {
+                    signingKey = realAttestKeyInfo.first
+                    issuer = realAttestKeyInfo.second
+                } else {
+                    signingKey = keybox.keyPair
+                    issuer = getIssuerFromKeybox(keybox)
+                }
 
                 val leafCert =
                     buildCertificate(subjectKeyPair, signingKey, issuer, params, uid, securityLevel)
 
-                if (attestKeyAlias != null) {
+                if (realAttestKeyInfo != null) {
                     listOf(leafCert)
                 } else {
                     listOf(leafCert) + keybox.certificates

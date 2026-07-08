@@ -2,6 +2,6 @@ id=tricky_store
 name=TEESimulator-Cat
 version=${REPLACEMEVER}
 versionCode=${REPLACEMEVERCODE}
-author=JingMatrix
+author=JingMatrix, CatCaller
 description=Software simulation for Android hardware-backed key pairs with key attestation
 updateJson=https://raw.githubusercontent.com/JingMatrix/TEESimulator/main/module/update.json

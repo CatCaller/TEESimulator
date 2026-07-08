@@ -1,8 +1,12 @@
-# TEESimulator – A Full TEE Emulation Framework
+# TEESimulator-Cat, A Full TEE Emulation Framework
 
 **TEESimulator** is a system module designed to create a complete, software-based simulation of a hardware-backed Trusted Execution Environment ([TEE](https://source.android.com/docs/security/features/trusty)) for [Key Attestation](https://developer.android.com/privacy-and-security/security-key-attestation).
 
 The project's goal is to move beyond simple certificate patching and build a robust framework that can create and manage virtual, self-consistent cryptographic keys.
+
+## Fork notes
+
+This fork merges the open PRs from upstream and fixes a few bugs found while testing on a real rooted phone: verifiedBootHash leaking as all zeroes, cert chains missing their root when the attest key fallback kicked in, key grant lookups scoped to the wrong uid so grantee apps got a broken/mismatched cert, updateAad throwing the wrong error type, and module files shipping with CRLF line endings that broke the daemon on flash.
 
 ## ✨ Core Principles
 

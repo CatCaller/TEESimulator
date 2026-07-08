@@ -79,7 +79,7 @@ androidComponents {
         // --- Define output locations and file names ---
         // Stage all files in a temporary directory inside 'build' before zipping
         val tempModuleDir = project.layout.buildDirectory.dir("module/${variant.name}")
-        val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
+        val zipFileName = "TEESimulator-Cat-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
 
         // Task 1: Prepare all module files in the temporary build directory.
         // Using Sync ensures that stale files from previous runs are removed.

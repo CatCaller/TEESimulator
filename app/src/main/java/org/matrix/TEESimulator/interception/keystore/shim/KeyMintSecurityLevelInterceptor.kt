@@ -206,6 +206,8 @@ class KeyMintSecurityLevelInterceptor(
      * Handles the `createOperation` transaction. It checks if the operation is for a key that was
      * generated in software. If so, it creates a software-based operation handler. Otherwise, it
      * lets the call proceed to the real hardware service.
+     *
+     * References: enforcements.rs: l=382 security_level.rs: l=402
      */
     private fun handleCreateOperation(
         txId: Long,
@@ -368,6 +370,9 @@ class KeyMintSecurityLevelInterceptor(
                         if (remaining.decrementAndGet() <= 0) {
                             cleanupKeyData(resolvedKeyId)
                             usageCounters.remove(resolvedKeyId)
+                            SystemLogger.info(
+                                "Key $resolvedKeyId exhausted (USAGE_COUNT_LIMIT=$limit)."
+                            )
                         }
                     }
                 }
@@ -846,6 +851,8 @@ class KeyMintSecurityLevelInterceptor(
 /**
  * Extension function to convert parsed `KeyMintAttestation` parameters back into an array of
  * `Authorization` objects for the fake `KeyMetadata`.
+ *
+ * References: security_level.rs: l=123, 165
  */
 private fun KeyMintAttestation.toAuthorizations(
     callingUid: Int,
@@ -935,9 +942,7 @@ private fun KeyMintAttestation.toAuthorizations(
         )
     }
     if (this.maxBootLevel != null) {
-        authList.add(
-            createAuth(Tag.MAX_BOOT_LEVEL, KeyParameterValue.integer(this.maxBootLevel))
-        )
+        authList.add(createAuth(Tag.MAX_BOOT_LEVEL, KeyParameterValue.integer(this.maxBootLevel)))
     }
 
     authList.add(
@@ -949,15 +954,22 @@ private fun KeyMintAttestation.toAuthorizations(
     )
 
     val osPatch = AndroidDeviceUtils.getPatchLevel(callingUid)
-    authList.add(createAuth(Tag.OS_PATCHLEVEL, KeyParameterValue.integer(osPatch)))
+    if (osPatch != AndroidDeviceUtils.DO_NOT_REPORT) {
+        authList.add(createAuth(Tag.OS_PATCHLEVEL, KeyParameterValue.integer(osPatch)))
+    }
 
     val vendorPatch = AndroidDeviceUtils.getVendorPatchLevelLong(callingUid)
-    authList.add(createAuth(Tag.VENDOR_PATCHLEVEL, KeyParameterValue.integer(vendorPatch)))
+    if (vendorPatch != AndroidDeviceUtils.DO_NOT_REPORT) {
+        authList.add(createAuth(Tag.VENDOR_PATCHLEVEL, KeyParameterValue.integer(vendorPatch)))
+    }
 
     val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(callingUid)
-    authList.add(createAuth(Tag.BOOT_PATCHLEVEL, KeyParameterValue.integer(bootPatch)))
+    if (bootPatch != AndroidDeviceUtils.DO_NOT_REPORT) {
+        authList.add(createAuth(Tag.BOOT_PATCHLEVEL, KeyParameterValue.integer(bootPatch)))
+    }
 
-    // Software-enforced tags: CREATION_DATETIME, enforcement dates, USER_ID.
+    // Software-enforced tags: CREATION_DATETIME, enforcement dates, USER_ID
+    // (security_level.rs: l=165, 436).
     fun createSwAuth(tag: Int, value: KeyParameterValue): Authorization {
         val param =
             KeyParameter().apply {
@@ -991,16 +1003,11 @@ private fun KeyMintAttestation.toAuthorizations(
         authList.add(createSwAuth(Tag.USAGE_COUNT_LIMIT, KeyParameterValue.integer(it)))
     }
     if (this.unlockedDeviceRequired == true) {
-        authList.add(
-            createSwAuth(Tag.UNLOCKED_DEVICE_REQUIRED, KeyParameterValue.boolValue(true))
-        )
+        authList.add(createSwAuth(Tag.UNLOCKED_DEVICE_REQUIRED, KeyParameterValue.boolValue(true)))
     }
 
     // AOSP class android.os.UserHandle: PER_USER_RANGE = 100000;
-    authList.add(
-        createSwAuth(Tag.USER_ID, KeyParameterValue.integer(callingUid / 100000))
-    )
-    )
+    authList.add(createSwAuth(Tag.USER_ID, KeyParameterValue.integer(callingUid / 100000)))
 
     return authList.toTypedArray()
 }

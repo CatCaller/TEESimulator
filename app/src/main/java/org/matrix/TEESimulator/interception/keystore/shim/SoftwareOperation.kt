@@ -14,36 +14,66 @@ import android.system.keystore2.IKeystoreOperation
 import android.system.keystore2.KeyParameters
 import java.security.KeyPair
 import java.security.Signature
-import java.security.SignatureException
 import javax.crypto.Cipher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
 
-/** Keystore2 error codes for ServiceSpecificException. Negative = KeyMint, positive = Keystore. */
+/*
+ * References:
+ * https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/operation.rs
+ * https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/security_level.rs
+ */
+/**
+ * Keystore2 error codes for ServiceSpecificException. Negative = KeyMint, positive = Keystore.
+ *
+ * Reference:
+ * https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/km_compat/km_compat_type_conversion.h
+ * Reference:
+ * https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/aidl/android/security/authorization/ResponseCode.aidl
+ */
 internal object KeystoreErrorCode {
+    /** km_compat_type_conversion.h: l=88 */
     const val INVALID_OPERATION_HANDLE = -28
+
+    /** km_compat_type_conversion.h: l=92 */
     const val VERIFICATION_FAILED = -30
+
+    /** km_compat_type_conversion.h: l=36 */
     const val UNSUPPORTED_PURPOSE = -2
+
+    /** km_compat_type_conversion.h: l=38 */
     const val INCOMPATIBLE_PURPOSE = -3
+
+    /** ResponseCode.aidl: l=35 */
     const val SYSTEM_ERROR = 4
+
+    /** Keystore2 ResponseCode::TOO_MUCH_DATA */
     const val TOO_MUCH_DATA = 21
+
+    /** km_compat_type_conversion.h: l=82 */
     const val KEY_EXPIRED = -25
+
+    /** km_compat_type_conversion.h: l=80 */
     const val KEY_NOT_YET_VALID = -24
 
-    /** KeyMint ErrorCode::CALLER_NONCE_PROHIBITED */
+    /** km_compat_type_conversion.h: l=138 */
     const val CALLER_NONCE_PROHIBITED = -55
 
-    /** KeyMint ErrorCode::INVALID_ARGUMENT */
+    /** km_compat_type_conversion.h: l=108 */
     const val INVALID_ARGUMENT = -38
 
-    /** KeyMint ErrorCode::INVALID_TAG */
+    /**
+     * KeyMint ErrorCode::INVALID_TAG
+     *
+     * km_compat_type_conversion.h: l=112
+     */
     const val INVALID_TAG = -40
 
-    /** Keystore2 ResponseCode::PERMISSION_DENIED */
+    /** ResponseCode.aidl: l=40 */
     const val PERMISSION_DENIED = 6
 
-    /** Keystore2 ResponseCode::KEY_NOT_FOUND */
+    /** ResponseCode.aidl: l=45 */
     const val KEY_NOT_FOUND = 7
 }
 
@@ -61,8 +91,10 @@ private sealed interface CryptoPrimitive {
     fun getBeginParameters(): Array<KeyParameter>? = null
 }
 
-// Helper object to map KeyMint constants to JCA algorithm strings.
+// Helper object to map KeyMint parameters onto the simulated software primitives we expose via JCA.
 private object JcaAlgorithmMapper {
+    // AOSP sign operations derive the effective signature behavior from the key algorithm and the
+    // selected digest (ecdsa_operation.cpp: l=79; rsa_operation.cpp: l=63).
     fun mapSignatureAlgorithm(params: KeyMintAttestation): String {
         val digest =
             when (params.digest.firstOrNull()) {
@@ -84,6 +116,8 @@ private object JcaAlgorithmMapper {
         return "${digest}with${keyAlgo}"
     }
 
+    // AOSP cipher operations derive behavior from algorithm, block mode, and padding tags
+    // (block_cipher_operation.cpp: l=39, 79; rsa_operation.cpp: l=66).
     fun mapCipherAlgorithm(params: KeyMintAttestation): String {
         val keyAlgo =
             when (params.algorithm) {
@@ -115,7 +149,8 @@ private object JcaAlgorithmMapper {
     }
 }
 
-// Concrete implementation for Signing.
+// Concrete implementation for Signing
+// (ecdsa_operation.cpp: l=138; rsa_operation.cpp: l=305).
 private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
     private val signature: Signature =
         Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply {
@@ -139,7 +174,8 @@ private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimi
     override fun abort() {}
 }
 
-// Concrete implementation for Verification.
+// Concrete implementation for Verification
+// (ecdsa_operation.cpp: l=273; rsa_operation.cpp: l=438).
 private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
     private val signature: Signature =
         Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply {
@@ -174,7 +210,7 @@ private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPri
     override fun abort() {}
 }
 
-// Concrete implementation for Encryption/Decryption.
+// Concrete implementation for Encryption/Decryption (block_cipher_operation.cpp: l=79).
 private class CipherPrimitive(
     cryptoKey: java.security.Key,
     params: KeyMintAttestation,
@@ -184,33 +220,35 @@ private class CipherPrimitive(
 ) : CryptoPrimitive {
     private val cipher: Cipher =
         Cipher.getInstance(JcaAlgorithmMapper.mapCipherAlgorithm(params)).apply {
-            val algSpec = when {
-                nonce != null && params.blockMode.contains(BlockMode.GCM) ->
-                    javax.crypto.spec.GCMParameterSpec((macLength ?: 128), nonce)
-                params.padding.contains(PaddingMode.RSA_OAEP) -> {
-                    val mgfDigest = when (params.rsaOaepMgfDigest.firstOrNull()) {
-                        Digest.SHA_2_256 -> "SHA-256"
-                        Digest.SHA_2_384 -> "SHA-384"
-                        Digest.SHA_2_512 -> "SHA-512"
-                        else -> "SHA-1"
+            val algSpec =
+                when {
+                    nonce != null && params.blockMode.contains(BlockMode.GCM) ->
+                        javax.crypto.spec.GCMParameterSpec((macLength ?: 128), nonce)
+                    params.padding.contains(PaddingMode.RSA_OAEP) -> {
+                        val mgfDigest =
+                            when (params.rsaOaepMgfDigest.firstOrNull()) {
+                                Digest.SHA_2_256 -> "SHA-256"
+                                Digest.SHA_2_384 -> "SHA-384"
+                                Digest.SHA_2_512 -> "SHA-512"
+                                else -> "SHA-1"
+                            }
+                        val mainDigest =
+                            when (params.digest.firstOrNull()) {
+                                Digest.SHA_2_256 -> "SHA-256"
+                                Digest.SHA_2_384 -> "SHA-384"
+                                Digest.SHA_2_512 -> "SHA-512"
+                                else -> "SHA-1"
+                            }
+                        javax.crypto.spec.OAEPParameterSpec(
+                            mainDigest,
+                            "MGF1",
+                            java.security.spec.MGF1ParameterSpec(mgfDigest),
+                            javax.crypto.spec.PSource.PSpecified.DEFAULT,
+                        )
                     }
-                    val mainDigest = when (params.digest.firstOrNull()) {
-                        Digest.SHA_2_256 -> "SHA-256"
-                        Digest.SHA_2_384 -> "SHA-384"
-                        Digest.SHA_2_512 -> "SHA-512"
-                        else -> "SHA-1"
-                    }
-                    javax.crypto.spec.OAEPParameterSpec(
-                        mainDigest,
-                        "MGF1",
-                        java.security.spec.MGF1ParameterSpec(mgfDigest),
-                        javax.crypto.spec.PSource.PSpecified.DEFAULT,
-                    )
+                    nonce != null -> javax.crypto.spec.IvParameterSpec(nonce)
+                    else -> null
                 }
-                nonce != null ->
-                    javax.crypto.spec.IvParameterSpec(nonce)
-                else -> null
-            }
             if (algSpec != null) init(opMode, cryptoKey, algSpec) else init(opMode, cryptoKey)
         }
 
@@ -225,7 +263,10 @@ private class CipherPrimitive(
         return try {
             if (data != null) cipher.doFinal(data) else cipher.doFinal()
         } catch (e: javax.crypto.AEADBadTagException) {
-            throw ServiceSpecificException(KeystoreErrorCode.VERIFICATION_FAILED, "GCM tag verification failed")
+            throw ServiceSpecificException(
+                KeystoreErrorCode.VERIFICATION_FAILED,
+                "GCM tag verification failed",
+            )
         }
     }
 
@@ -243,7 +284,7 @@ private class CipherPrimitive(
     }
 }
 
-// Concrete implementation for ECDH Key Agreement.
+// Concrete implementation for ECDH Key Agreement (ecdh_operation.cpp: l=52).
 private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
     private val agreement: javax.crypto.KeyAgreement =
         javax.crypto.KeyAgreement.getInstance("ECDH").apply { init(keyPair.private) }

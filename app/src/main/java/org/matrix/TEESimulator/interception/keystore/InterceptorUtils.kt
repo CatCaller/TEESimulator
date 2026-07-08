@@ -33,7 +33,6 @@ object InterceptorUtils {
         }
     }
 
-    /** Creates an `KeystoreResponse` parcel that indicates success with no data. */
     fun createSuccessKeystoreResponse(): KeystoreResponse {
         val parcel = Parcel.obtain()
         try {
@@ -44,6 +43,45 @@ object InterceptorUtils {
         } finally {
             parcel.recycle()
         }
+    }
+
+    fun patchAuthorizations(
+        authorizations: Array<Authorization>?,
+        callingUid: Int,
+    ): Array<Authorization>? {
+        if (authorizations == null) return null
+
+        val osPatch = AndroidDeviceUtils.getPatchLevel(callingUid)
+        val vendorPatch = AndroidDeviceUtils.getVendorPatchLevelLong(callingUid)
+        val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(callingUid)
+
+        return authorizations
+            .map { auth ->
+                val replacement =
+                    when (auth.keyParameter.tag) {
+                        Tag.OS_PATCHLEVEL ->
+                            if (osPatch != AndroidDeviceUtils.DO_NOT_REPORT) osPatch else null
+                        Tag.VENDOR_PATCHLEVEL ->
+                            if (vendorPatch != AndroidDeviceUtils.DO_NOT_REPORT) vendorPatch
+                            else null
+                        Tag.BOOT_PATCHLEVEL ->
+                            if (bootPatch != AndroidDeviceUtils.DO_NOT_REPORT) bootPatch else null
+                        else -> null
+                    }
+                if (replacement != null) {
+                    Authorization().apply {
+                        keyParameter =
+                            KeyParameter().apply {
+                                tag = auth.keyParameter.tag
+                                value = KeyParameterValue.integer(replacement)
+                            }
+                        securityLevel = auth.securityLevel
+                    }
+                } else {
+                    auth
+                }
+            }
+            .toTypedArray()
     }
 
     /** Creates an `OverrideReply` parcel that indicates success with no data. */
@@ -97,6 +135,28 @@ object InterceptorUtils {
     }
 
     /**
+     * Creates an `OverrideReply` that writes a `ServiceSpecificException` with the given error
+     * code. Uses the C++ binder::Status wire format which includes a remote stack trace header
+     * between the message and the error code. Java's Parcel.writeException omits this header,
+     * making it incompatible with native C++ AIDL clients on Android 12+.
+     *
+     * Wire format: [int32 exceptionCode] [String16 message] [int32 stackTraceSize=0] [int32
+     * errorCode]
+     */
+    fun createServiceSpecificErrorReply(
+        errorCode: Int
+    ): BinderInterceptor.TransactionResult.OverrideReply {
+        val parcel =
+            Parcel.obtain().apply {
+                writeInt(-8) // EX_SERVICE_SPECIFIC
+                writeString(null) // message (null → writeInt(-1) as String16 null marker)
+                writeInt(0) // remote stack trace header size (empty)
+                writeInt(errorCode) // service-specific error code
+            }
+        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
+    }
+
+    /**
      * Extracts the base alias from a potentially prefixed alias string. For example, it converts
      * "USRCERT_my_key" to "my_key".
      */
@@ -121,73 +181,5 @@ object InterceptorUtils {
             reply.setDataPosition(pos)
             true
         }
-    }
-
-    /**
-     * Creates an `OverrideReply` that writes a `ServiceSpecificException` with the given error
-     * code. Uses the C++ binder::Status wire format which includes a remote stack trace
-     * header between the message and the error code. Java's Parcel.writeException omits
-     * this header, making it incompatible with native C++ AIDL clients on Android 12+.
-     *
-     * Wire format: [int32 exceptionCode] [String16 message] [int32 stackTraceSize=0] [int32 errorCode]
-     */
-    fun createServiceSpecificErrorReply(
-        errorCode: Int
-    ): BinderInterceptor.TransactionResult.OverrideReply {
-        val parcel =
-            Parcel.obtain().apply {
-                writeInt(-8) // EX_SERVICE_SPECIFIC
-                writeString(null) // message (null → writeInt(-1) as String16 null marker)
-                writeInt(0) // remote stack trace header size (empty)
-                writeInt(errorCode) // service-specific error code
-            }
-        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
-    }
-
-    /**
-     * Patches the system-level authorization values (OS_PATCHLEVEL, VENDOR_PATCHLEVEL,
-     * BOOT_PATCHLEVEL) in an authorization array to match the configured patch levels for the
-     * given calling UID. Each authorization's original [Authorization.securityLevel] is preserved.
-     *
-     * When a patch level is configured as "no" ([AndroidDeviceUtils.DO_NOT_REPORT]), the original
-     * hardware value is kept as-is.
-     */
-    fun patchAuthorizations(
-        authorizations: Array<Authorization>?,
-        callingUid: Int,
-    ): Array<Authorization>? {
-        if (authorizations == null) return null
-
-        val osPatch = AndroidDeviceUtils.getPatchLevel(callingUid)
-        val vendorPatch = AndroidDeviceUtils.getVendorPatchLevelLong(callingUid)
-        val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(callingUid)
-
-        return authorizations
-            .map { auth ->
-                val replacement =
-                    when (auth.keyParameter.tag) {
-                        Tag.OS_PATCHLEVEL ->
-                            if (osPatch != AndroidDeviceUtils.DO_NOT_REPORT) osPatch else null
-                        Tag.VENDOR_PATCHLEVEL ->
-                            if (vendorPatch != AndroidDeviceUtils.DO_NOT_REPORT) vendorPatch
-                            else null
-                        Tag.BOOT_PATCHLEVEL ->
-                            if (bootPatch != AndroidDeviceUtils.DO_NOT_REPORT) bootPatch else null
-                        else -> null
-                    }
-                if (replacement != null) {
-                    Authorization().apply {
-                        keyParameter =
-                            KeyParameter().apply {
-                                tag = auth.keyParameter.tag
-                                value = KeyParameterValue.integer(replacement)
-                            }
-                        securityLevel = auth.securityLevel
-                    }
-                } else {
-                    auth
-                }
-            }
-            .toTypedArray()
     }
 }

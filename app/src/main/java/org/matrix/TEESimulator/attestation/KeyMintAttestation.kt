@@ -41,6 +41,9 @@ data class KeyMintAttestation(
     val manufacturer: ByteArray?,
     val model: ByteArray?,
     val secondImei: ByteArray?,
+    // Operation params (present on createOperation for symmetric ciphers), absent at generateKey.
+    val nonce: ByteArray? = null,
+    val macLength: Int = 0,
 ) {
     /** Secondary constructor that populates the fields by parsing an array of `KeyParameter`. */
     constructor(
@@ -104,6 +107,10 @@ data class KeyMintAttestation(
         manufacturer = params.findBlob(Tag.ATTESTATION_ID_MANUFACTURER),
         model = params.findBlob(Tag.ATTESTATION_ID_MODEL),
         secondImei = params.findBlob(Tag.ATTESTATION_ID_SECOND_IMEI),
+
+        // AOSP: [key_param(tag = NONCE, field = Blob)] / [key_param(tag = MAC_LENGTH, field = Integer)]
+        nonce = params.findBlob(Tag.NONCE),
+        macLength = params.findInteger(Tag.MAC_LENGTH) ?: 0,
     ) {
         // Log all parsed parameters for debugging purposes.
         params.forEach { KeyMintParameterLogger.logParameter(it) }

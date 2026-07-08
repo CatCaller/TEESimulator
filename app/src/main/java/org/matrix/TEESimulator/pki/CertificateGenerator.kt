@@ -14,6 +14,8 @@ import java.security.interfaces.RSAKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.RSAKeyGenParameterSpec
 import java.util.Date
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.asn1.x509.Extension
 import org.bouncycastle.asn1.x509.KeyUsage
@@ -70,6 +72,44 @@ object CertificateGenerator {
                     .generateKeyPair()
             }
             .onFailure { SystemLogger.error("Failed to generate software key pair.", it) }
+            .getOrNull()
+    }
+
+    /** True for algorithms that produce a symmetric secret key rather than a key pair. */
+    fun isSymmetric(algorithm: Int): Boolean =
+        algorithm == Algorithm.AES ||
+            algorithm == Algorithm.HMAC ||
+            algorithm == Algorithm.TRIPLE_DES
+
+    /**
+     * Generates a software-based symmetric secret key (AES / HMAC / 3DES).
+     *
+     * Symmetric keys have no attestation certificate chain, so callers should return a
+     * [KeyMetadata] with an empty certificate list. Returns `null` on failure.
+     */
+    fun generateSecretKey(params: KeyMintAttestation): SecretKey? {
+        return runCatching {
+                val algorithm =
+                    when (params.algorithm) {
+                        Algorithm.AES -> "AES"
+                        Algorithm.HMAC ->
+                            when (params.digest.firstOrNull()) {
+                                android.hardware.security.keymint.Digest.SHA_2_224 -> "HmacSHA224"
+                                android.hardware.security.keymint.Digest.SHA_2_384 -> "HmacSHA384"
+                                android.hardware.security.keymint.Digest.SHA_2_512 -> "HmacSHA512"
+                                android.hardware.security.keymint.Digest.SHA1 -> "HmacSHA1"
+                                else -> "HmacSHA256"
+                            }
+                        Algorithm.TRIPLE_DES -> "DESede"
+                        else ->
+                            throw IllegalArgumentException(
+                                "Not a symmetric algorithm: ${params.algorithm}"
+                            )
+                    }
+                SystemLogger.debug("Generating $algorithm secret key with size ${params.keySize}")
+                KeyGenerator.getInstance(algorithm).apply { init(params.keySize) }.generateKey()
+            }
+            .onFailure { SystemLogger.error("Failed to generate software secret key.", it) }
             .getOrNull()
     }
 

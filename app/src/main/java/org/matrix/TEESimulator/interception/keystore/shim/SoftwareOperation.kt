@@ -8,9 +8,14 @@ import android.hardware.security.keymint.PaddingMode
 import android.os.RemoteException
 import android.system.keystore2.IKeystoreOperation
 import java.security.KeyPair
+import java.security.SecureRandom
 import java.security.Signature
 import java.security.SignatureException
 import javax.crypto.Cipher
+import javax.crypto.Mac
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.IvParameterSpec
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
@@ -142,31 +147,114 @@ private class CipherPrimitive(
     override fun abort() {}
 }
 
+// Concrete implementation for symmetric Encryption/Decryption (AES / 3DES).
+// Handles the IV/nonce for CBC and GCM block modes. On ENCRYPT the caller does not supply an IV,
+// so one is generated and prepended to the first output chunk (matching KeyMint's behaviour of
+// returning the IV to the client). On DECRYPT the IV/nonce is taken from the operation params.
+private class SecretCipherPrimitive(
+    private val secretKey: SecretKey,
+    private val params: KeyMintAttestation,
+    private val opMode: Int,
+) : CryptoPrimitive {
+    private val blockMode = params.blockMode.firstOrNull()
+    private val transformation = JcaAlgorithmMapper.mapCipherAlgorithm(params)
+    private val cipher: Cipher = Cipher.getInstance(transformation)
+    private var ivEmitted = false
+    private var generatedIv: ByteArray? = null
+
+    init {
+        val needsIv = blockMode == BlockMode.CBC || blockMode == BlockMode.GCM
+        if (opMode == Cipher.ENCRYPT_MODE) {
+            if (needsIv) {
+                val ivLen = if (blockMode == BlockMode.GCM) 12 else 16
+                val iv = ByteArray(ivLen).also { SecureRandom().nextBytes(it) }
+                generatedIv = iv
+                cipher.init(opMode, secretKey, buildSpec(iv))
+            } else {
+                cipher.init(opMode, secretKey)
+            }
+        } else {
+            if (needsIv) {
+                val iv =
+                    params.nonce
+                        ?: throw IllegalArgumentException("Missing IV/nonce for decrypt operation")
+                cipher.init(opMode, secretKey, buildSpec(iv))
+            } else {
+                cipher.init(opMode, secretKey)
+            }
+        }
+    }
+
+    private fun buildSpec(iv: ByteArray) =
+        if (blockMode == BlockMode.GCM) {
+            val macBits = if (params.macLength > 0) params.macLength else 128
+            GCMParameterSpec(macBits, iv)
+        } else {
+            IvParameterSpec(iv)
+        }
+
+    // Prepend the generated IV to the first output produced during an encrypt operation.
+    private fun maybePrependIv(out: ByteArray?): ByteArray? {
+        if (opMode != Cipher.ENCRYPT_MODE || ivEmitted) return out
+        val iv = generatedIv ?: return out
+        ivEmitted = true
+        return iv + (out ?: ByteArray(0))
+    }
+
+    override fun update(data: ByteArray?): ByteArray? =
+        maybePrependIv(if (data != null) cipher.update(data) else null)
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? =
+        maybePrependIv(if (data != null) cipher.doFinal(data) else cipher.doFinal())
+
+    override fun abort() {}
+}
+
+// Concrete implementation for HMAC signing/verification with a symmetric key.
+private class MacPrimitive(secretKey: SecretKey, params: KeyMintAttestation) : CryptoPrimitive {
+    private val mac: Mac =
+        Mac.getInstance(secretKey.algorithm).apply { init(secretKey) }
+
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        val computed = mac.doFinal()
+        // VERIFY passes the expected MAC as `signature`; SIGN returns the computed MAC.
+        if (signature != null) {
+            if (!computed.contentEquals(signature))
+                throw SignatureException("HMAC verification failed")
+            return null
+        }
+        return computed
+    }
+
+    override fun abort() {}
+}
+
 /**
  * A software-only implementation of a cryptographic operation. This class acts as a controller,
  * delegating to a specific cryptographic primitive based on the operation's purpose.
  */
-class SoftwareOperation(private val txId: Long, keyPair: KeyPair, params: KeyMintAttestation) {
-    // This now holds the specific strategy object (Signer, Verifier, etc.)
-    private val primitive: CryptoPrimitive
+class SoftwareOperation
+private constructor(private val txId: Long, private val primitive: CryptoPrimitive) {
 
-    init {
-        // The "Strategy" pattern: choose the implementation based on the purpose.
-        // For simplicity, we only consider the first purpose listed.
-        val purpose = params.purpose.firstOrNull()
-        val purposeName = KeyMintParameterLogger.purposeNames[purpose] ?: "UNKNOWN"
-        SystemLogger.debug("[SoftwareOp TX_ID: $txId] Initializing for purpose: $purposeName.")
+    // Asymmetric (KeyPair-backed) operations: SIGN / VERIFY / ENCRYPT / DECRYPT.
+    constructor(
+        txId: Long,
+        keyPair: KeyPair,
+        params: KeyMintAttestation,
+    ) : this(txId, selectAsymmetricPrimitive(txId, keyPair, params))
 
-        primitive =
-            when (purpose) {
-                KeyPurpose.SIGN -> Signer(keyPair, params)
-                KeyPurpose.VERIFY -> Verifier(keyPair, params)
-                KeyPurpose.ENCRYPT -> CipherPrimitive(keyPair, params, Cipher.ENCRYPT_MODE)
-                KeyPurpose.DECRYPT -> CipherPrimitive(keyPair, params, Cipher.DECRYPT_MODE)
-                else ->
-                    throw UnsupportedOperationException("Unsupported operation purpose: $purpose")
-            }
-    }
+    // Symmetric (SecretKey-backed) operations: AES/3DES cipher + HMAC.
+    constructor(
+        txId: Long,
+        secretKey: SecretKey,
+        params: KeyMintAttestation,
+    ) : this(txId, selectSymmetricPrimitive(txId, secretKey, params))
 
     fun update(data: ByteArray?): ByteArray? {
         try {
@@ -192,6 +280,50 @@ class SoftwareOperation(private val txId: Long, keyPair: KeyPair, params: KeyMin
     fun abort() {
         primitive.abort()
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
+    }
+
+    companion object {
+        private fun logPurpose(txId: Long, params: KeyMintAttestation) {
+            val purpose = params.purpose.firstOrNull()
+            val purposeName = KeyMintParameterLogger.purposeNames[purpose] ?: "UNKNOWN"
+            SystemLogger.debug("[SoftwareOp TX_ID: $txId] Initializing for purpose: $purposeName.")
+        }
+
+        private fun selectAsymmetricPrimitive(
+            txId: Long,
+            keyPair: KeyPair,
+            params: KeyMintAttestation,
+        ): CryptoPrimitive {
+            logPurpose(txId, params)
+            return when (params.purpose.firstOrNull()) {
+                KeyPurpose.SIGN -> Signer(keyPair, params)
+                KeyPurpose.VERIFY -> Verifier(keyPair, params)
+                KeyPurpose.ENCRYPT -> CipherPrimitive(keyPair, params, Cipher.ENCRYPT_MODE)
+                KeyPurpose.DECRYPT -> CipherPrimitive(keyPair, params, Cipher.DECRYPT_MODE)
+                else ->
+                    throw UnsupportedOperationException(
+                        "Unsupported operation purpose: ${params.purpose.firstOrNull()}"
+                    )
+            }
+        }
+
+        private fun selectSymmetricPrimitive(
+            txId: Long,
+            secretKey: SecretKey,
+            params: KeyMintAttestation,
+        ): CryptoPrimitive {
+            logPurpose(txId, params)
+            return when (params.purpose.firstOrNull()) {
+                KeyPurpose.ENCRYPT -> SecretCipherPrimitive(secretKey, params, Cipher.ENCRYPT_MODE)
+                KeyPurpose.DECRYPT -> SecretCipherPrimitive(secretKey, params, Cipher.DECRYPT_MODE)
+                KeyPurpose.SIGN,
+                KeyPurpose.VERIFY -> MacPrimitive(secretKey, params)
+                else ->
+                    throw UnsupportedOperationException(
+                        "Unsupported symmetric operation purpose: ${params.purpose.firstOrNull()}"
+                    )
+            }
+        }
     }
 }
 

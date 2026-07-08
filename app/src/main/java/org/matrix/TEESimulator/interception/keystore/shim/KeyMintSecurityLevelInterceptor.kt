@@ -12,6 +12,7 @@ import java.security.KeyPair
 import java.security.SecureRandom
 import java.security.cert.Certificate
 import java.util.concurrent.ConcurrentHashMap
+import javax.crypto.SecretKey
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
@@ -33,10 +34,12 @@ class KeyMintSecurityLevelInterceptor(
 ) : BinderInterceptor() {
 
     // --- Data Structures for State Management ---
+    // Exactly one of [keyPair] (asymmetric) or [secretKey] (symmetric AES/HMAC/3DES) is set.
     data class GeneratedKeyInfo(
-        val keyPair: KeyPair,
+        val keyPair: KeyPair?,
         val nspace: Long,
         val response: KeyEntryResponse,
+        val secretKey: SecretKey? = null,
     )
 
     override fun onPreTransact(
@@ -211,7 +214,12 @@ class KeyMintSecurityLevelInterceptor(
         val params = data.createTypedArray(KeyParameter.CREATOR)!!
         val parsedParams = KeyMintAttestation(params)
 
-        val softwareOperation = SoftwareOperation(txId, generatedKeyInfo.keyPair, parsedParams)
+        val softwareOperation =
+            if (generatedKeyInfo.secretKey != null) {
+                SoftwareOperation(txId, generatedKeyInfo.secretKey, parsedParams)
+            } else {
+                SoftwareOperation(txId, generatedKeyInfo.keyPair!!, parsedParams)
+            }
         val operationBinder = SoftwareOperationBinder(softwareOperation)
 
         val response =
@@ -246,6 +254,33 @@ class KeyMintSecurityLevelInterceptor(
                         (ConfigurationManager.shouldPatch(callingUid) && isAttestKeyRequest) ||
                         (attestationKey != null &&
                             isAttestationKey(KeyIdentifier(callingUid, attestationKey.alias)))
+
+                if (needsSoftwareGeneration && CertificateGenerator.isSymmetric(parsedParams.algorithm)) {
+                    // Symmetric keys (AES/HMAC/3DES) have no attestation certificate chain.
+                    // e.g. Google Wallet's `google_pay_keyguard_fuse_key` (AES-128, keyguard-bound).
+                    keyDescriptor.nspace = secureRandom.nextLong()
+                    SystemLogger.info(
+                        "Generating software secret key for ${keyDescriptor.alias}[${keyDescriptor.nspace}]."
+                    )
+
+                    val secretKey =
+                        CertificateGenerator.generateSecretKey(parsedParams)
+                            ?: throw Exception("Failed to generate underlying secret key.")
+
+                    val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+                    cleanupKeyData(keyId)
+                    val response =
+                        buildSymmetricKeyEntryResponse(callingUid, parsedParams, keyDescriptor)
+                    generatedKeys[keyId] =
+                        GeneratedKeyInfo(
+                            keyPair = null,
+                            nspace = keyDescriptor.nspace,
+                            response = response,
+                            secretKey = secretKey,
+                        )
+
+                    return@runCatching InterceptorUtils.createTypedObjectReply(response.metadata)
+                }
 
                 if (needsSoftwareGeneration) {
                     keyDescriptor.nspace = secureRandom.nextLong()
@@ -317,6 +352,38 @@ class KeyMintSecurityLevelInterceptor(
             }
         CertificateHelper.updateCertificateChain(callingUid, metadata, chain.toTypedArray())
             .getOrThrow()
+        return KeyEntryResponse().apply {
+            this.metadata = metadata
+            iSecurityLevel = original
+        }
+    }
+
+    /**
+     * Constructs a `KeyEntryResponse` for a symmetric key. Unlike asymmetric keys, symmetric keys
+     * carry no attestation certificate chain, so the metadata's certificate/certificateChain are
+     * left null.
+     */
+    private fun buildSymmetricKeyEntryResponse(
+        callingUid: Int,
+        params: KeyMintAttestation,
+        descriptor: KeyDescriptor,
+    ): KeyEntryResponse {
+        val normalizedKeyDescriptor =
+            KeyDescriptor().apply {
+                domain = Domain.KEY_ID
+                nspace = descriptor.nspace
+                alias = null
+                blob = null
+            }
+        val metadata =
+            KeyMetadata().apply {
+                keySecurityLevel = securityLevel
+                key = normalizedKeyDescriptor
+                authorizations = params.toAuthorizations(callingUid, securityLevel)
+                certificate = null
+                certificateChain = null
+                modificationTimeMs = System.currentTimeMillis()
+            }
         return KeyEntryResponse().apply {
             this.metadata = metadata
             iSecurityLevel = original

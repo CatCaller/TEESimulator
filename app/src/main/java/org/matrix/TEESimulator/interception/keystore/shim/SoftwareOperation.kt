@@ -257,8 +257,12 @@ private class CipherPrimitive(
     // KeyMint HAL requires updateAad to happen before any update() call; once data processing
     // starts, further AAD is rejected with INVALID_OPERATION_HANDLE, not a raw cipher exception.
     private var aadWindowClosed = false
+    private val isAead = nonce != null && params.blockMode.contains(BlockMode.GCM)
 
     override fun updateAad(data: ByteArray?) {
+        // updateAad only makes sense for AEAD modes (GCM); a non-AEAD cipher (CBC/CTR/ECB) has no
+        // AAD concept in the underlying Cipher, so real KeyMint rejects it outright.
+        if (!isAead) throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
         if (aadWindowClosed) throw ServiceSpecificException(KeystoreErrorCode.INVALID_OPERATION_HANDLE)
         if (data != null) cipher.updateAAD(data)
     }

@@ -225,10 +225,7 @@ class KeyMintSecurityLevelInterceptor(
                 Domain.KEY_ID -> {
                     val nspace = keyDescriptor.nspace
                     if (nspace == 0L) null
-                    else
-                        generatedKeys.entries
-                            .filter { it.key.uid == callingUid }
-                            .find { it.value.nspace == nspace }
+                    else generatedKeys.entries.find { it.value.nspace == nspace }
                 }
                 Domain.APP ->
                     keyDescriptor.alias?.let { alias ->
@@ -796,21 +793,17 @@ class KeyMintSecurityLevelInterceptor(
             generatedKeys[keyId]?.response ?: teeResponses[keyId]
 
         /**
-         * Finds a software-generated key by first filtering all known keys by the caller's UID, and
-         * then matching the specific nspace.
+         * Finds a software-generated key by nspace. nspace is globally unique across UIDs — it's
+         * how a grantee UID references an owner's key via Android's key grant mechanism — so this
+         * must not be scoped to the calling UID. Real Keystore2 already enforces the grant ACL
+         * before this hook runs.
          *
-         * @param callingUid The UID of the process that initiated the createOperation call.
          * @param nspace The unique key identifier from the operation's KeyDescriptor.
          * @return The matching GeneratedKeyInfo if found, otherwise null.
          */
-        fun findGeneratedKeyByKeyId(callingUid: Int, nspace: Long?): GeneratedKeyInfo? {
-            // Iterate through all entries in the map to check both the key (for UID) and value (for
-            // nspace).
+        fun findGeneratedKeyByKeyId(nspace: Long?): GeneratedKeyInfo? {
             if (nspace == null || nspace == 0L) return null
-            return generatedKeys.entries
-                .filter { (keyIdentifier, _) -> keyIdentifier.uid == callingUid }
-                .find { (_, info) -> info.nspace == nspace }
-                ?.value
+            return generatedKeys.entries.find { (_, info) -> info.nspace == nspace }?.value
         }
 
         fun getPatchedChain(keyId: KeyIdentifier): Array<Certificate>? = patchedChains[keyId]

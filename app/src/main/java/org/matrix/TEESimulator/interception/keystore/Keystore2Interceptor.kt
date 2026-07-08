@@ -171,13 +171,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     if (descriptor.alias != null) {
                         KeyIdentifier(callingUid, descriptor.alias)
                     } else if (descriptor.domain == Domain.KEY_ID) {
-                        KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(
-                            callingUid, descriptor.nspace
-                        )?.let { info ->
-                            KeyMintSecurityLevelInterceptor.generatedKeys.entries
-                                .find { it.value.nspace == info.nspace && it.key.uid == callingUid }
-                                ?.key
-                        }
+                        // Delete stays owner-only even though nspace lookup is now UID-agnostic.
+                        KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(descriptor.nspace)
+                            ?.let { info ->
+                                KeyMintSecurityLevelInterceptor.generatedKeys.entries
+                                    .find { it.value.nspace == info.nspace && it.key.uid == callingUid }
+                                    ?.key
+                            }
                     } else null
 
                 if (keyId != null) {
@@ -434,10 +434,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         val generatedKeyInfo =
             when (descriptor.domain) {
                 Domain.KEY_ID ->
-                    KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(
-                        callingUid,
-                        descriptor.nspace,
-                    )
+                    KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(descriptor.nspace)
                 Domain.APP ->
                     descriptor.alias?.let {
                         KeyMintSecurityLevelInterceptor.generatedKeys[KeyIdentifier(callingUid, it)]

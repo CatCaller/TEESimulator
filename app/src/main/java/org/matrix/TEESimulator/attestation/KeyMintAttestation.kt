@@ -58,6 +58,9 @@ data class KeyMintAttestation(
     val maxBootLevel: Int?,
     val minMacLength: Int?,
     val rsaOaepMgfDigest: List<Int>,
+    // Operation params (present on createOperation for symmetric ciphers), absent at generateKey.
+    val nonce: ByteArray? = null,
+    val macLength: Int = 0,
 ) {
     /** Secondary constructor that populates the fields by parsing an array of `KeyParameter`. */
     constructor(
@@ -144,6 +147,10 @@ data class KeyMintAttestation(
         maxBootLevel = params.findInteger(Tag.MAX_BOOT_LEVEL),
         minMacLength = params.findInteger(Tag.MIN_MAC_LENGTH),
         rsaOaepMgfDigest = params.findAllDigests(Tag.RSA_OAEP_MGF_DIGEST),
+
+        // AOSP: [key_param(tag = NONCE, field = Blob)] / [key_param(tag = MAC_LENGTH, field = Integer)]
+        nonce = params.findBlob(Tag.NONCE),
+        macLength = params.findInteger(Tag.MAC_LENGTH) ?: 0,
     ) {
         // Log all parsed parameters for debugging purposes.
         params.forEach { KeyMintParameterLogger.logParameter(it) }

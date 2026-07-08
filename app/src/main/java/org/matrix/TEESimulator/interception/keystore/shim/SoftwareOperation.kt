@@ -15,6 +15,8 @@ import android.system.keystore2.KeyParameters
 import java.security.KeyPair
 import java.security.Signature
 import javax.crypto.Cipher
+import javax.crypto.Mac
+import javax.crypto.SecretKey
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
@@ -311,6 +313,38 @@ private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
     override fun abort() {}
 }
 
+// Concrete implementation for HMAC signing/verification with a symmetric key.
+private class MacPrimitive(secretKey: SecretKey, params: KeyMintAttestation) : CryptoPrimitive {
+    private val mac: Mac =
+        Mac.getInstance(secretKey.algorithm).apply { init(secretKey) }
+
+    override fun updateAad(data: ByteArray?) {
+        throw ServiceSpecificException(KeystoreErrorCode.INVALID_TAG)
+    }
+
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        val computed = mac.doFinal()
+        // VERIFY passes the expected MAC as `signature`; SIGN returns the computed MAC.
+        if (signature != null) {
+            if (!computed.contentEquals(signature))
+                throw ServiceSpecificException(
+                    KeystoreErrorCode.VERIFICATION_FAILED,
+                    "HMAC verification failed",
+                )
+            return null
+        }
+        return computed
+    }
+
+    override fun abort() {}
+}
+
 /**
  * A software-only implementation of a cryptographic operation. This class acts as a controller,
  * delegating to a specific cryptographic primitive based on the operation's purpose.
@@ -321,7 +355,7 @@ private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
 class SoftwareOperation(
     private val txId: Long,
     keyPair: KeyPair?,
-    secretKey: javax.crypto.SecretKey?,
+    secretKey: SecretKey?,
     params: KeyMintAttestation,
     opParams: Array<KeyParameter> = emptyArray(),
     var onFinishCallback: (() -> Unit)? = null,
@@ -337,8 +371,12 @@ class SoftwareOperation(
 
         primitive =
             when (purpose) {
-                KeyPurpose.SIGN -> Signer(keyPair!!, params)
-                KeyPurpose.VERIFY -> Verifier(keyPair!!, params)
+                KeyPurpose.SIGN ->
+                    if (secretKey != null) MacPrimitive(secretKey, params)
+                    else Signer(keyPair!!, params)
+                KeyPurpose.VERIFY ->
+                    if (secretKey != null) MacPrimitive(secretKey, params)
+                    else Verifier(keyPair!!, params)
                 KeyPurpose.ENCRYPT -> {
                     val key: java.security.Key = secretKey ?: keyPair!!.public
                     val nonce = opParams.find { it.tag == Tag.NONCE }?.value?.blob
